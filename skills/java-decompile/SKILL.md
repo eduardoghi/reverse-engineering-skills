@@ -63,12 +63,14 @@ there when you need to know what a method does.
 
 - Without an output directory it creates a new `${TMPDIR:-/tmp}/<jar name>-src.XXXXXX` with `mktemp`
   and prints the final path. Read the path from the output instead of guessing it.
-- Every output directory gets a `.java-decompile-output` marker file.
+- Every output directory it creates, or finds empty and starts using, gets a `.java-decompile-output`
+  marker file.
 - A non-empty output directory is refused. `--clean` empties it (keeping the directory) only if it has
-  the marker. A folder that java-decompile didn't create is never cleaned; delete it by hand if you
-  really want to reuse it.
-- Never reuse an output directory for a different input, since files from the earlier run would look
-  like part of the new one.
+  the marker. Any other non-empty folder is never cleaned. Delete it by hand if you really want to
+  reuse it.
+- `--clean` accepts a marked directory even if it was used for another input, since it empties it
+  first. For version comparisons, still use one directory per version.
+- When the input is a directory of classes, the output can't be the same directory or inside it.
 - An output path that is a symlink, a regular file or a directory owned by another user is refused, and
   so are `/`, `$HOME` and the current directory.
 - If `--only` fails or finds nothing in a JAR (Vineflower 1.12.0 crashes with `NoSuchFileException` on

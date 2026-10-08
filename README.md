@@ -41,5 +41,5 @@ java-decompile --only=com/vendor/product app.jar /tmp/product-src
 java-decompile --check
 ```
 
-`--clean` only empties directories that java-decompile created itself (they have a
-`.java-decompile-output` marker). It refuses any other non-empty folder.
+`--clean` only empties directories that java-decompile created or initialized while they were empty
+(they have a `.java-decompile-output` marker). It refuses any other non-empty folder.

@@ -200,6 +200,13 @@ else
             die "input is inside the output directory: $input"
             ;;
     esac
+    if [ -d "$input" ]; then
+        case "$output" in
+            "$input"/*)
+                die "output directory is inside the input directory: $output"
+                ;;
+        esac
+    fi
 
     [ ! -L "$output" ] || die "output is a symlink, refusing to follow it: $output"
     if [ ! -e "$output" ]; then
