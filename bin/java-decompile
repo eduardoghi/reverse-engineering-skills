@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# Decompile a JAR, a .class file or a directory of classes with Vineflower.
+#
+# Usage:
+#   java-decompile [--clean] [--only=PREFIX] <input> [output-dir] [-- vineflower options...]
+#   java-decompile --check
+#
+# Options:
+#   --clean        delete output-dir first if it already has files
+#   --only=PREFIX  decompile only classes under PREFIX (slash-separated, e.g. com/foo/bar)
+#   --check        check the required tools and exit
+#   -h, --help     show this help
+#
+# Without output-dir, the result goes to ${TMPDIR:-/tmp}/<input name>-src.
+# A non-empty output-dir is never reused unless --clean is given, so files from an
+# earlier run can't mix with the new one.
+#
+# When --only finds nothing in a JAR (e.g. classes stored under BOOT-INF/classes or
+# WEB-INF/classes), the matching entries are extracted to a temporary directory and
+# decompiled from there.
+set -euo pipefail
+
+prog=$(basename "$0")
+
+die() {
+    echo "$prog: $*" >&2
+    exit 1
+}
+
+usage() {
+    sed -n '2,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p}' "$0"
+}
+
+check() {
+    local status=0 java_ver vf_ver cfr_ver major
+
+    if command -v java >/dev/null 2>&1; then
+        java_ver=$(java -version 2>&1 | sed -n '1s/.*version "\([^"]*\)".*/\1/p')
+        major=${java_ver%%.*}
+        if [ -n "$major" ] && [ "$major" -ge 17 ] 2>/dev/null; then
+            printf '%-11s OK       %s\n' java "$java_ver"
+        else
+            printf '%-11s TOO OLD  %s (Vineflower needs Java 17+)\n' java "${java_ver:-unknown}"
+            status=1
+        fi
+    else
+        printf '%-11s MISSING  nothing below can run\n' java
+        status=1
+    fi
+
+    if command -v vineflower >/dev/null 2>&1; then
+        vf_ver=$(vineflower --help 2>&1 | sed -n 's/.*Vineflower Decompiler \([0-9.]*\).*/\1/p' | head -n 1)
+        printf '%-11s OK       %s\n' vineflower "${vf_ver:-unknown version}"
+    else
+        printf '%-11s MISSING  java-decompile cannot run\n' vineflower
+        status=1
+    fi
+
+    if command -v cfr >/dev/null 2>&1; then
+        cfr_ver=$(cfr --version 2>&1 | sed -n 's/^CFR \([0-9.]*\).*/\1/p' | head -n 1)
+        printf '%-11s OK       %s\n' cfr "${cfr_ver:-unknown version}"
+    else
+        printf '%-11s MISSING  no second opinion when Vineflower output looks wrong\n' cfr
+    fi
+
+    for tool in javap jar; do
+        if command -v "$tool" >/dev/null 2>&1; then
+            printf '%-11s OK\n' "$tool"
+        else
+            printf '%-11s MISSING  install a full JDK, not only a JRE\n' "$tool"
+        fi
+    done
+
+    if command -v unzip >/dev/null 2>&1; then
+        printf '%-11s OK\n' unzip
+    else
+        printf '%-11s MISSING  --only fallback for JARs will not work\n' unzip
+    fi
+
+    return "$status"
+}
+
+count_java() {
+    find "$1" -type f -name '*.java' | wc -l
+}
+
+# Runs in the background and waits, so INT/TERM reach the trap right away and can
+# stop Vineflower instead of waiting for the whole JAR to finish.
+child=""
+run_vineflower() {
+    local rc=0
+    vineflower --folder --log-level=error "$@" &
+    child=$!
+    wait "$child" || rc=$?
+    child=""
+    return "$rc"
+}
+
+clean=0
+only=""
+input=""
+output=""
+extra=()
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check)
+            check
+            exit $?
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --clean)
+            clean=1
+            ;;
+        --only=*)
+            only=${1#--only=}
+            only=${only#/}
+            only=${only%/}
+            [ -n "$only" ] || die "--only needs a prefix, e.g. --only=com/foo"
+            ;;
+        --only)
+            die "use --only=PREFIX (with =)"
+            ;;
+        --)
+            shift
+            extra=("$@")
+            break
+            ;;
+        -*)
+            die "unknown option: $1 (pass Vineflower options after --)"
+            ;;
+        *)
+            if [ -z "$input" ]; then
+                input=$1
+            elif [ -z "$output" ]; then
+                output=$1
+            else
+                die "too many arguments: $1"
+            fi
+            ;;
+    esac
+    shift
+done
+
+[ -n "$input" ] || { usage >&2; exit 2; }
+[ -e "$input" ] || die "input not found: $input"
+command -v vineflower >/dev/null 2>&1 || die "vineflower is not on PATH (run $prog --check)"
+
+input=$(realpath -- "$input")
+
+if [ -z "$output" ]; then
+    name=$(basename -- "$input")
+    output="${TMPDIR:-/tmp}/${name%.*}-src"
+fi
+output=$(realpath -m -- "$output")
+
+case "$output" in
+    /|"$HOME"|"$PWD")
+        die "refusing to use $output as output directory"
+        ;;
+esac
+case "$input" in
+    "$output"|"$output"/*)
+        die "input is inside the output directory: $input"
+        ;;
+esac
+
+if [ -e "$output" ] && [ ! -d "$output" ]; then
+    die "output exists and is not a directory: $output"
+fi
+
+if [ -d "$output" ] && [ -n "$(ls -A -- "$output")" ]; then
+    if [ "$clean" -eq 1 ]; then
+        rm -rf -- "$output"
+    else
+        die "output directory is not empty: $output (use --clean to replace it)"
+    fi
+fi
+mkdir -p -- "$output"
+
+tmp=""
+cleanup() {
+    if [ -n "$child" ]; then
+        kill -TERM "$child" 2>/dev/null || true
+        wait "$child" 2>/dev/null || true
+    fi
+    if [ -n "$tmp" ]; then
+        rm -rf -- "$tmp"
+    fi
+}
+trap cleanup EXIT
+trap 'echo "$prog: interrupted, $output may be incomplete" >&2; exit 130' INT
+trap 'echo "$prog: terminated, $output may be incomplete" >&2; exit 143' TERM
+
+if [ -z "$only" ]; then
+    run_vineflower "${extra[@]}" "$input" "$output"
+else
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/java-decompile.XXXXXX")
+
+    # Vineflower 1.12.0 can crash here (NoSuchFileException) when the classes sit
+    # under BOOT-INF/classes, so keep its errors until we know the fallback is needed.
+    if run_vineflower --only="$only" "${extra[@]}" "$input" "$output" 2>"$tmp/vineflower.err" \
+        && [ "$(count_java "$output")" -gt 0 ]; then
+        :
+    elif [ -f "$input" ] && command -v unzip >/dev/null 2>&1 && unzip -tqq "$input" >/dev/null 2>&1; then
+        echo "$prog: --only=$only failed or found nothing, extracting matching entries" >&2
+        find "$output" -mindepth 1 -delete
+
+        # Usually only one of the three layouts exists. unzip then exits with 11
+        # and prints "filename not matched" for the others, so that is not an error.
+        rc=0
+        unzip -qq -o "$input" \
+            "$only/*" "BOOT-INF/classes/$only/*" "WEB-INF/classes/$only/*" \
+            -d "$tmp/raw" 2>"$tmp/unzip.err" || rc=$?
+        if [ "$rc" -ne 0 ] && [ "$rc" -ne 11 ]; then
+            cat "$tmp/unzip.err" >&2
+            die "unzip failed with exit code $rc"
+        fi
+
+        # Merge the layouts into one class root so the output paths match a direct run.
+        found=0
+        for layout in "" "BOOT-INF/classes/" "WEB-INF/classes/"; do
+            if [ -d "$tmp/raw/$layout$only" ]; then
+                mkdir -p -- "$tmp/classes/$only"
+                cp -r -- "$tmp/raw/$layout$only/." "$tmp/classes/$only/"
+                found=1
+            fi
+        done
+        [ "$found" -eq 1 ] && [ -n "$(find "$tmp/classes" -type f -name '*.class' -print -quit)" ] \
+            || die "no classes under $only in $input (check the layout with: jar tf '$input')"
+
+        run_vineflower "${extra[@]}" "$tmp/classes" "$output"
+    else
+        cat "$tmp/vineflower.err" >&2
+        die "Vineflower produced no sources for --only=$only"
+    fi
+fi
+
+n=$(count_java "$output")
+[ "$n" -gt 0 ] || die "no .java files were produced in $output"
+echo "$output ($n files)"

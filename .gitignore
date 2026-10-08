@@ -1,0 +1,14 @@
+# Decompiled output and extracted binaries never belong in this repo.
+*-src/
+*-src-cfr/
+*.jar
+*.class
+out/
+tmp/
+.tmp/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
