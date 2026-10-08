@@ -59,6 +59,25 @@ Run `java-decompile --check` if any of them seems to be missing.
 `javap -p` alone is fine for a quick look at signatures and `javap -v` for the constant pool. Don't stop
 there when you need to know what a method does.
 
+## Shell tips
+
+- Print one method from the bytecode instead of the whole class. The range ends at the blank line after
+  the method, after its exception table:
+
+  ```sh
+  javap -c -p -cp app.jar com.vendor.product.Foo | awk '/ methodName\(/,/^$/'
+  ```
+
+- Signed JARs list a digest for every entry in `MANIFEST.MF`, which can be tens of thousands of lines.
+  Print only the main section. The file uses CRLF, hence the `\r`:
+
+  ```sh
+  unzip -p app.jar META-INF/MANIFEST.MF | sed '/^\r\?$/q'
+  ```
+
+- `grep` treats `.class` files as binary and lists nothing for `-l`. Add `-a` to search strings in
+  extracted classes (`grep -rla 'X-Api-Key' classes/`).
+
 ## java-decompile behaviour
 
 - Without an output directory it creates a new `${TMPDIR:-/tmp}/<jar name>-src.XXXXXX` with `mktemp`
