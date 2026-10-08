@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+"""Cross-references for 32-bit PE files (BPL, DLL or EXE), tuned for Delphi.
+
+  bpl-xref str FILE STRING...         code that references a string literal
+  bpl-xref calls FILE ADDR|EXPORT...  calls, jumps and pointers to an address
+  bpl-xref flags FILE [START END]     rizin flags for import thunks and literals
+
+Each reference in code shows the nearest function prologue before it
+(push ebp; mov ebp, esp) and the exported functions around it. Nested
+procedures are not exported and sit right before the function that contains
+them, so the "next" export is often the real owner.
+
+When the file has a relocation table, only relocated pointers count as
+references, which drops numbers that happen to have the same value.
+"""
+import argparse
+import bisect
+import re
+import struct
+import sys
+
+try:
+    import pefile
+except ImportError:
+    sys.exit("bpl-xref: needs the pefile module (pacman -S python-pefile or pip install pefile)")
+
+PROLOGUE = b"\x55\x8b\xec"
+IMAGE_SCN_MEM_EXECUTE = 0x20000000
+IMAGE_REL_BASED_HIGHLOW = 3
+MAX_LITERAL = 1 << 16
+
+
+class Image:
+    def __init__(self, path):
+        # pefile stops at 8192 exports by default and treats the rest as
+        # corrupt. Delphi packages export every unit symbol and easily pass
+        # that (60k+ in large BPLs). The limit has to go to the constructor,
+        # the module constant is only read as its default.
+        try:
+            pe = pefile.PE(path, fast_load=True, max_symbol_exports=1 << 20)
+        except pefile.PEFormatError as e:
+            sys.exit(f"bpl-xref: {path}: not a PE file ({e})")
+        if pe.OPTIONAL_HEADER.Magic != pefile.OPTIONAL_HEADER_MAGIC_PE:
+            sys.exit(f"bpl-xref: {path}: 64-bit PE, only 32-bit code uses absolute pointers")
+        pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_EXPORT"]])
+        self.pe = pe
+        self.data = pe.__data__
+        self.base = pe.OPTIONAL_HEADER.ImageBase
+        self.code = [s for s in pe.sections if s.Characteristics & IMAGE_SCN_MEM_EXECUTE]
+        self.relocs = self._highlow_relocs()
+        self.funcs = self._exported_functions()
+        self.func_addrs = [a for a, _ in self.funcs]
+
+    def in_code(self, va):
+        rva = va - self.base
+        return any(s.VirtualAddress <= rva < s.VirtualAddress + s.Misc_VirtualSize for s in self.code)
+
+    def to_va(self, off):
+        rva = self.pe.get_rva_from_offset(off)
+        return None if rva is None else self.base + rva
+
+    def to_off(self, va):
+        try:
+            return self.pe.get_offset_from_rva(va - self.base)
+        except pefile.PEFormatError:
+            return None
+
+    def read_u32(self, va):
+        off = self.to_off(va)
+        if off is None or off + 4 > len(self.data):
+            return None
+        return struct.unpack_from("<I", self.data, off)[0]
+
+    def code_ranges(self):
+        """Yield (file offset, size, va) for the raw data of each executable section."""
+        for s in self.code:
+            size = min(s.SizeOfRawData, s.Misc_VirtualSize or s.SizeOfRawData)
+            yield s.PointerToRawData, size, self.base + s.VirtualAddress
+
+    def _highlow_relocs(self):
+        """Return the RVAs patched by HIGHLOW relocations, or None without a relocation table.
+
+        Parsed by hand because pefile builds one object per entry, which is
+        slow with the hundreds of thousands of entries a large BPL has.
+        """
+        d = self.pe.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_BASERELOC"]]
+        if not d.VirtualAddress or not d.Size:
+            return None
+        data = self.data
+        off = self.to_off(self.base + d.VirtualAddress)
+        if off is None:
+            return None
+        # A truncated or malformed table ends the walk instead of raising.
+        end = min(off + d.Size, len(data))
+        rvas = set()
+        while off + 8 <= end:
+            page, size = struct.unpack_from("<II", data, off)
+            if size < 8:
+                break
+            entries = data[off + 8:min(off + size, end)]
+            for (entry,) in struct.iter_unpack("<H", entries[:len(entries) & ~1]):
+                if entry >> 12 == IMAGE_REL_BASED_HIGHLOW:
+                    rvas.add(page + (entry & 0xFFF))
+            off += size
+        return rvas
+
+    def _exported_functions(self):
+        """Exports inside executable sections, minus Delphi RTTI and VMTs."""
+        if not hasattr(self.pe, "DIRECTORY_ENTRY_EXPORT"):
+            return []
+        funcs = []
+        for sym in self.pe.DIRECTORY_ENTRY_EXPORT.symbols:
+            if not sym.name or sym.forwarder:
+                continue
+            name = sym.name.decode("latin-1")
+            # Delphi keeps type info (@$xp$...) and class VMTs (@Unit@TClass@)
+            # in the code section too. Neither is a function.
+            if name.startswith("@$xp$") or (name.startswith("@") and name.endswith("@")):
+                continue
+            va = self.base + sym.address
+            if self.in_code(va):
+                funcs.append((va, name))
+        funcs.sort()
+        return funcs
+
+    def export_address(self, name):
+        if hasattr(self.pe, "DIRECTORY_ENTRY_EXPORT"):
+            for sym in self.pe.DIRECTORY_ENTRY_EXPORT.symbols:
+                if sym.name and sym.name.decode("latin-1") == name:
+                    return self.base + sym.address
+        return None
+
+    def pointers_to(self, targets):
+        """Yield (va, target) for each 32-bit pointer to one of targets.
+
+        With a relocation table only relocated slots count, anywhere in the
+        file. Without one, any matching value inside code is reported.
+        """
+        data = self.data
+        if self.relocs is not None:
+            for rva in self.relocs:
+                value = self.read_u32(self.base + rva)
+                if value in targets:
+                    yield self.base + rva, value
+            return
+        for target in targets:
+            pat = struct.pack("<I", target)
+            for start, size, va0 in self.code_ranges():
+                ref = data.find(pat, start, start + size)
+                while ref != -1:
+                    yield va0 + ref - start, target
+                    ref = data.find(pat, ref + 1, start + size)
+
+    def describe(self, va):
+        """Lines locating va: nearest prologue and surrounding exports, or its section."""
+        if not self.in_code(va):
+            section = self.pe.get_section_by_rva(va - self.base)
+            name = section.Name.rstrip(b"\0").decode("latin-1") if section else "?"
+            return [f"in section {name}"]
+        lines = []
+        off = self.to_off(va)
+        section = self.pe.get_section_by_rva(va - self.base)
+        start = self.data.rfind(PROLOGUE, section.PointerToRawData, off)
+        if start != -1:
+            lines.append(f"nearest prologue 0x{self.to_va(start):08x}")
+        i = bisect.bisect_right(self.func_addrs, va)
+        if i > 0:
+            a, n = self.funcs[i - 1]
+            lines.append(f"prev export 0x{a:08x} {n}")
+        if i < len(self.funcs):
+            a, n = self.funcs[i]
+            lines.append(f"next export 0x{a:08x} {n}")
+        return lines
+
+    def literal_at(self, va):
+        """Return (text, size in bytes) when va is the first char of a Delphi string literal.
+
+        Literals have a -1 reference count and a 32-bit length right before
+        the text. A UnicodeString (Delphi 2009+) also has an element size of 2
+        in front of that.
+        """
+        data = self.data
+        off = self.to_off(va)
+        if off is None or off < 8 or data[off - 8:off - 4] != b"\xff\xff\xff\xff":
+            return None
+        n = struct.unpack_from("<I", data, off - 4)[0]
+        if not 0 < n <= MAX_LITERAL:
+            return None
+        if off >= 10 and data[off - 10:off - 8] == b"\x02\x00" and data[off + 2 * n:off + 2 * n + 2] == b"\0\0":
+            text = data[off:off + 2 * n].decode("utf-16-le", "replace")
+            size = 2 * n
+        elif data[off + n:off + n + 1] == b"\0":
+            text = data[off:off + n].decode("latin-1")
+            size = n
+        else:
+            return None
+        if not all(c.isprintable() or c in "\t\r\n" for c in text):
+            return None
+        return text, size
+
+    def c_string(self, va, limit=1024):
+        off = self.to_off(va)
+        if off is None:
+            return None
+        end = self.data.find(b"\0", off, off + limit)
+        return None if end == -1 else self.data[off:end].decode("latin-1")
+
+    def import_slots(self):
+        """Map each IAT slot address to (dll, function name).
+
+        Read by hand because pefile skips imports after 8192 symbols and drops
+        names with characters it doesn't expect, such as the % in Delphi's
+        `System@%SmallString$iuc$255%`. Large BPLs hit both.
+        """
+        d = self.pe.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]]
+        slots = {}
+        if not d.VirtualAddress:
+            return slots
+        desc = self.base + d.VirtualAddress
+        # The table ends with an all-zero descriptor. The directory size bounds
+        # the walk when that terminator is missing or the table is corrupt.
+        # The Windows loader ignores that size, and some files that load fine
+        # declare it too small or zero, so at least one descriptor is read.
+        # With a zero size only the first DLL's imports get names.
+        for _ in range(max(d.Size // 20, 1)):
+            fields = [self.read_u32(desc + 4 * k) for k in range(5)]
+            if None in fields:
+                break
+            lookup, _stamp, _chain, name_rva, first_thunk = fields
+            if not (lookup or name_rva or first_thunk):
+                break
+            dll = self.c_string(self.base + name_rva) or "?"
+            table = lookup or first_thunk
+            for i in range(1 << 20):
+                entry = self.read_u32(self.base + table + 4 * i)
+                if not entry:
+                    break
+                if entry & 0x80000000:
+                    name = f"ord{entry & 0xFFFF}"
+                else:
+                    name = self.c_string(self.base + entry + 2) or f"slot{i}"
+                slots[self.base + first_thunk + 4 * i] = (dll, name)
+            desc += 20
+        return slots
+
+    def import_thunks(self):
+        """Yield (va, dll, name) for each `jmp dword [iat]` thunk in code."""
+        iat = self.import_slots()
+        pat = re.compile(rb"\xff\x25(.{4})", re.S)
+        for start, size, va0 in self.code_ranges():
+            for m in pat.finditer(self.data, start, start + size):
+                slot = struct.unpack("<I", m.group(1))[0]
+                if slot in iat:
+                    yield (va0 + m.start() - start, *iat[slot])
+
+
+def literal_kind(data, off, nbytes, enc):
+    """Guess the Delphi literal layout from the bytes before a match.
+
+    Only a hint: any data that happens to have a matching length byte or
+    header in front of the text gets the same label.
+    """
+    if enc == "latin-1" and off >= 1 and data[off - 1] == nbytes and nbytes < 256:
+        return "ShortString"
+    if off >= 8 and data[off - 8:off - 4] == b"\xff\xff\xff\xff":
+        length = struct.unpack_from("<I", data, off - 4)[0]
+        if enc == "latin-1" and length == nbytes:
+            return "AnsiString literal"
+        if enc == "utf-16-le" and length == nbytes // 2:
+            return "UnicodeString literal"
+    return None
+
+
+def print_refs(img, refs):
+    for kind, va in sorted(refs, key=lambda r: r[1]):
+        print(f"    {kind} 0x{va:08x}")
+        for line in img.describe(va):
+            print(f"        {line}")
+
+
+def cmd_str(img, args):
+    data = img.data
+    any_match = False
+    for needle in args.strings:
+        for enc in ("latin-1", "utf-16-le"):
+            try:
+                pat = needle.encode(enc)
+            except UnicodeEncodeError:
+                continue
+            step = 1 if enc == "latin-1" else 2
+            off = data.find(pat)
+            while off != -1:
+                kind = literal_kind(data, off, len(pat), enc)
+                terminated = data[off + len(pat):off + len(pat) + step].strip(b"\0") == b""
+                va = img.to_va(off)
+                if va is not None and (kind or terminated):
+                    any_match = True
+                    label = f", {kind}" if kind else ""
+                    print(f"{needle!r} ({enc}{label}) at 0x{va:08x}")
+                    # Delphi code points at the first character of AnsiString
+                    # and UnicodeString literals, and at the length byte of
+                    # ShortString constants.
+                    targets = {va, va - 1} if kind == "ShortString" else {va}
+                    # Pointers outside code usually sit in tables (package
+                    # lists, resource strings, records). They are listed too,
+                    # since the code reads the table slot, not the string.
+                    refs = [("ref" if img.in_code(ref) else "ptr", ref)
+                            for ref, _ in img.pointers_to(targets)]
+                    if kind == "ShortString":
+                        print(f"    length byte at 0x{va - 1:08x}")
+                    if refs:
+                        print_refs(img, refs)
+                        if any(k == "ptr" for k, _ in refs):
+                            print("    (run `bpl-xref calls` on a ptr address to find the code that reads it)")
+                    else:
+                        print("    no direct references")
+                off = data.find(pat, off + 1)
+    if not any_match:
+        sys.exit("bpl-xref: no match")
+
+
+def cmd_calls(img, args):
+    targets = {}
+    for arg in args.targets:
+        try:
+            va = int(arg, 16)
+        except ValueError:
+            va = img.export_address(arg)
+            if va is None:
+                sys.exit(f"bpl-xref: {arg!r} is neither a hex address nor an export name")
+        targets[va] = []
+
+    data = img.data
+    # call/jmp rel32: target = address of the next instruction + rel32.
+    # Matches inside other instructions are possible but would also need to
+    # land exactly on the target.
+    opcodes = {0xE8: "call", 0xE9: "jmp"}
+    pat = re.compile(rb"[\xe8\xe9]")
+    for start, size, va0 in img.code_ranges():
+        end = start + size - 4
+        for m in pat.finditer(data, start, end):
+            i = m.start()
+            va = va0 + i - start
+            target = (va + 5 + struct.unpack_from("<i", data, i + 1)[0]) & 0xFFFFFFFF
+            if target in targets:
+                targets[target].append((opcodes[data[i]], va))
+    for va, target in img.pointers_to(set(targets)):
+        targets[target].append(("ptr", va))
+
+    if img.relocs is None:
+        print("no relocation table: pointers are matching values in code, some may be unrelated numbers")
+    for target, refs in targets.items():
+        print(f"0x{target:08x}")
+        if refs:
+            print_refs(img, refs)
+        else:
+            print("    no references (it may only be reached through a register or a table built at run time)")
+
+
+def flag_name(prefix, text, limit):
+    return prefix + re.sub(r"[^A-Za-z0-9_.]", "_", text.lstrip("@"))[:limit]
+
+
+def cmd_flags(img, args):
+    used = set()
+
+    def emit(name, size, va):
+        # Check against every name already emitted: a literal "Customer 1"
+        # sanitizes to the same name a second "Customer" would get.
+        unique, n = name, 1
+        while unique in used:
+            unique = f"{name}_{n}"
+            n += 1
+        used.add(unique)
+        print(f"f+ {unique} {size} @ 0x{va:08x}")
+
+    # No `fs` commands: with a flagspace selected, rizin 0.8 slows `pD` down
+    # from milliseconds to a fifth of a second per instruction.
+    thunks = 0
+    for va, _dll, name in img.import_thunks():
+        emit(flag_name("thunk.", name, 96), 6, va)
+        thunks += 1
+
+    lo = int(args.start, 16) if args.start else None
+    hi = int(args.end, 16) if args.end else None
+    targets = set()
+    if lo is not None:
+        if img.relocs is not None:
+            targets = {img.read_u32(img.base + rva) for rva in img.relocs if lo <= img.base + rva < hi}
+        else:
+            off = img.to_off(lo)
+            if off is None:
+                sys.exit(f"bpl-xref: 0x{lo:08x} is not inside the file")
+            chunk = img.data[off:off + (hi - lo) + 3]
+            targets = {struct.unpack_from("<I", chunk, i)[0] for i in range(len(chunk) - 3)}
+    elif img.relocs is not None:
+        targets = {img.read_u32(img.base + rva) for rva in img.relocs}
+    else:
+        for start, size, va0 in img.code_ranges():
+            for m in re.finditer(rb"\xff\xff\xff\xff", img.data[start:start + size]):
+                targets.add(va0 + m.end() + 4)
+
+    strings = 0
+    targets.discard(None)
+    for va in sorted(targets):
+        lit = img.literal_at(va)
+        if lit:
+            text, size = lit
+            emit(flag_name("str.", text, 48), size, va)
+            strings += 1
+    print(f"bpl-xref: {thunks} import thunks, {strings} string literals", file=sys.stderr)
+
+
+def main():
+    head, tail = __doc__.split("\n\n", 1)
+    ap = argparse.ArgumentParser(prog="bpl-xref", description=head, epilog=tail,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True, metavar="command")
+
+    p = sub.add_parser("str", help="find the code that references a string",
+                       description="For each ANSI or UTF-16LE match of a string, print the literal kind "
+                                   "and every reference to it from code.")
+    p.add_argument("file")
+    p.add_argument("strings", nargs="+", metavar="string", help="exact text to look for (case-sensitive)")
+    p.set_defaults(func=cmd_str)
+
+    p = sub.add_parser("calls", help="find calls, jumps and pointers to an address",
+                       description="List call/jmp rel32 instructions and relocated pointers (method "
+                                   "tables, event handlers) that lead to each address. Use it for "
+                                   "nested procedures and other functions without exports.")
+    p.add_argument("file")
+    p.add_argument("targets", nargs="+", metavar="addr", help="hex address or exact export name")
+    p.set_defaults(func=cmd_calls)
+
+    p = sub.add_parser("flags", help="print rizin flags for import thunks and string literals",
+                       description="Print rizin commands that name import thunks (thunk.*) and Delphi "
+                                   "string literals (str.*), so `pd` shows `call thunk.Unit_Func` and "
+                                   "`mov edx, str.Text`. Load them with `rizin -i flags.rz`. "
+                                   "With START END, only literals referenced from that address range "
+                                   "are included, since a large package can have hundreds of "
+                                   "thousands and each one slows down rizin's startup.")
+    p.add_argument("file")
+    p.add_argument("start", nargs="?", help="start of the code range (hex)")
+    p.add_argument("end", nargs="?", help="end of the code range (hex, exclusive)")
+    p.set_defaults(func=cmd_flags)
+
+    args = ap.parse_args()
+    if args.cmd == "flags":
+        if bool(args.start) != bool(args.end):
+            ap.error("flags needs both START and END, or neither")
+        try:
+            if args.start and int(args.end, 16) <= int(args.start, 16):
+                ap.error("flags: END must be greater than START")
+        except ValueError:
+            ap.error("flags: START and END must be hex addresses")
+    args.func(Image(args.file), args)
+
+
+if __name__ == "__main__":
+    main()

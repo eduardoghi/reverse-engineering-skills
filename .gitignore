@@ -12,3 +12,13 @@ tmp/
 .idea/
 *.swp
 .DS_Store
+
+# Native binaries and Ghidra projects
+*.bpl
+*.dll
+*.exe
+*.gpr
+*.rep/
+
+# Python
+__pycache__/
