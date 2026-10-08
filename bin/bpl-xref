@@ -30,6 +30,15 @@ IMAGE_REL_BASED_HIGHLOW = 3
 MAX_LITERAL = 1 << 16
 
 
+def safe(text):
+    """Escape control and non-ASCII characters in names read from the file.
+
+    Export and section names come from the binary under analysis, and a
+    crafted one could carry terminal escape sequences.
+    """
+    return "".join(c if " " <= c <= "~" else f"\\x{ord(c):02x}" for c in text)
+
+
 class Image:
     def __init__(self, path):
         # pefile stops at 8192 exports by default and treats the rest as
@@ -156,7 +165,7 @@ class Image:
         if not self.in_code(va):
             section = self.pe.get_section_by_rva(va - self.base)
             name = section.Name.rstrip(b"\0").decode("latin-1") if section else "?"
-            return [f"in section {name}"]
+            return [f"in section {safe(name)}"]
         lines = []
         off = self.to_off(va)
         section = self.pe.get_section_by_rva(va - self.base)
@@ -166,10 +175,10 @@ class Image:
         i = bisect.bisect_right(self.func_addrs, va)
         if i > 0:
             a, n = self.funcs[i - 1]
-            lines.append(f"prev export 0x{a:08x} {n}")
+            lines.append(f"prev export 0x{a:08x} {safe(n)}")
         if i < len(self.funcs):
             a, n = self.funcs[i]
-            lines.append(f"next export 0x{a:08x} {n}")
+            lines.append(f"next export 0x{a:08x} {safe(n)}")
         return lines
 
     def literal_at(self, va):
