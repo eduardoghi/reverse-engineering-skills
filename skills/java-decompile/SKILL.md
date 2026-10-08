@@ -61,14 +61,23 @@ there when you need to know what a method does.
 
 ## java-decompile behaviour
 
-- Without an output directory it writes to `${TMPDIR:-/tmp}/<jar name>-src`.
-- It refuses a non-empty output directory. Pass `--clean` to replace it. Never reuse an output directory
-  for a different input, since files from the earlier run would look like part of the new one.
+- Without an output directory it creates a new `${TMPDIR:-/tmp}/<jar name>-src.XXXXXX` with `mktemp`
+  and prints the final path. Read the path from the output instead of guessing it.
+- Every output directory gets a `.java-decompile-output` marker file.
+- A non-empty output directory is refused. `--clean` empties it (keeping the directory) only if it has
+  the marker. A folder that java-decompile didn't create is never cleaned; delete it by hand if you
+  really want to reuse it.
+- Never reuse an output directory for a different input, since files from the earlier run would look
+  like part of the new one.
+- An output path that is a symlink, a regular file or a directory owned by another user is refused, and
+  so are `/`, `$HOME` and the current directory.
 - If `--only` fails or finds nothing in a JAR (Vineflower 1.12.0 crashes with `NoSuchFileException` on
   classes under `BOOT-INF/classes/`), it extracts the matching classes from the root, `BOOT-INF/classes/`
   and `WEB-INF/classes/` into a temporary directory and decompiles them from there. The output paths
   are the same as a direct run.
-- Extra Vineflower options go after `--`, e.g. `java-decompile app.jar out -- --thread-count=4`.
+- Extra Vineflower options go after `--`, e.g. `java-decompile app.jar out -- --thread-count=4`. The
+  script passes them before `--only`, because Vineflower 1.12.0 treats anything after `--only=` as an
+  input path and ignores it with `warn: missing '...'`. Keep that order if you call Vineflower directly.
 - A full decompile of a 15 MB fat JAR takes minutes. Use `--only` whenever you know the package.
 
 ## Comparing two versions of a JAR

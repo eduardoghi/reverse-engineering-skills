@@ -34,9 +34,12 @@ Requirements:
 ## Examples
 
 ```sh
-java-decompile app.jar                          # -> /tmp/app-src
+java-decompile app.jar                          # -> /tmp/app-src.XXXXXX
 java-decompile app.jar /tmp/app-src
-java-decompile --clean app.jar /tmp/app-src     # replace an earlier run
+java-decompile --clean app.jar /tmp/app-src     # replace an earlier java-decompile run
 java-decompile --only=com/vendor/product app.jar /tmp/product-src
 java-decompile --check
 ```
+
+`--clean` only empties directories that java-decompile created itself (they have a
+`.java-decompile-output` marker). It refuses any other non-empty folder.

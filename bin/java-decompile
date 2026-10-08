@@ -6,14 +6,18 @@
 #   java-decompile --check
 #
 # Options:
-#   --clean        delete output-dir first if it already has files
+#   --clean        empty output-dir first if an earlier java-decompile run left files there
 #   --only=PREFIX  decompile only classes under PREFIX (slash-separated, e.g. com/foo/bar)
 #   --check        check the required tools and exit
 #   -h, --help     show this help
 #
-# Without output-dir, the result goes to ${TMPDIR:-/tmp}/<input name>-src.
-# A non-empty output-dir is never reused unless --clean is given, so files from an
-# earlier run can't mix with the new one.
+# Without output-dir, the result goes to a new ${TMPDIR:-/tmp}/<input name>-src.XXXXXX
+# directory. The final path is printed at the end.
+#
+# Output directories get a .java-decompile-output marker. A non-empty output-dir is
+# reused only with --clean and only if it has that marker, so an earlier run can't
+# mix with the new one and --clean can't empty an unrelated folder. Symlinks and
+# directories owned by another user are refused.
 #
 # When --only finds nothing in a JAR (e.g. classes stored under BOOT-INF/classes or
 # WEB-INF/classes), the matching entries are extracted to a temporary directory and
@@ -96,6 +100,21 @@ run_vineflower() {
     return "$rc"
 }
 
+# Marks a directory as output of this script. --clean only empties directories
+# that have it, so it can't wipe an arbitrary folder by mistake.
+marker=.java-decompile-output
+write_marker() {
+    printf 'created_by=%s\ninput=%s\ncreated_at=%s\n' \
+        "$prog" "$input" "$(date -Iseconds)" >"$output/$marker"
+}
+
+# Empties the output but keeps the directory itself. find without -L deletes
+# symlinks inside it as links and never follows them.
+clear_output() {
+    find "$output" -mindepth 1 -delete
+    write_marker
+}
+
 clean=0
 only=""
 input=""
@@ -152,34 +171,56 @@ command -v vineflower >/dev/null 2>&1 || die "vineflower is not on PATH (run $pr
 input=$(realpath -- "$input")
 
 if [ -z "$output" ]; then
+    # A fresh directory with a random suffix, created atomically, so nothing planted
+    # in a shared /tmp under a predictable name can be picked up.
     name=$(basename -- "$input")
-    output="${TMPDIR:-/tmp}/${name%.*}-src"
-fi
-output=$(realpath -m -- "$output")
+    output=$(mktemp -d "${TMPDIR:-/tmp}/${name%.*}-src.XXXXXX")
+    write_marker
+else
+    # Resolve only the parent. The last component is checked as it is, so a symlink
+    # there is refused instead of silently followed.
+    while [ "${#output}" -gt 1 ] && [ "${output%/}" != "$output" ]; do
+        output=${output%/}
+    done
+    [ "$output" != "/" ] || die "refusing to use / as output directory"
+    base=$(basename -- "$output")
+    case "$base" in
+        .|..) die "name the output directory instead of using $base" ;;
+    esac
+    parent=$(realpath -m -- "$(dirname -- "$output")")
+    output="${parent%/}/$base"
 
-case "$output" in
-    /|"$HOME"|"$PWD")
-        die "refusing to use $output as output directory"
-        ;;
-esac
-case "$input" in
-    "$output"|"$output"/*)
-        die "input is inside the output directory: $input"
-        ;;
-esac
+    case "$output" in
+        "$(realpath -m -- "$HOME")"|"$(pwd -P)")
+            die "refusing to use $output as output directory"
+            ;;
+    esac
+    case "$input" in
+        "$output"|"$output"/*)
+            die "input is inside the output directory: $input"
+            ;;
+    esac
 
-if [ -e "$output" ] && [ ! -d "$output" ]; then
-    die "output exists and is not a directory: $output"
-fi
-
-if [ -d "$output" ] && [ -n "$(ls -A -- "$output")" ]; then
-    if [ "$clean" -eq 1 ]; then
-        rm -rf -- "$output"
+    [ ! -L "$output" ] || die "output is a symlink, refusing to follow it: $output"
+    if [ ! -e "$output" ]; then
+        mkdir -p -- "$parent"
+        # Plain mkdir fails if something appeared at this path in the meantime.
+        mkdir -- "$output" || die "could not create $output"
+        write_marker
     else
-        die "output directory is not empty: $output (use --clean to replace it)"
+        [ -d "$output" ] || die "output exists and is not a directory: $output"
+        [ -O "$output" ] || die "output belongs to another user: $output"
+        if [ -z "$(ls -A -- "$output")" ]; then
+            write_marker
+        elif [ ! -f "$output/$marker" ]; then
+            die "$output is not empty and was not created by $prog, refusing to touch it"
+        elif [ "$clean" -eq 1 ]; then
+            clear_output
+        else
+            die "output directory is not empty: $output (use --clean to replace it)"
+        fi
     fi
 fi
-mkdir -p -- "$output"
 
 tmp=""
 cleanup() {
@@ -191,9 +232,12 @@ cleanup() {
         rm -rf -- "$tmp"
     fi
 }
+# fd 3 keeps the original stderr: the signal can arrive while stderr is redirected
+# to a temporary log, and the warning must still reach the user.
+exec 3>&2
 trap cleanup EXIT
-trap 'echo "$prog: interrupted, $output may be incomplete" >&2; exit 130' INT
-trap 'echo "$prog: terminated, $output may be incomplete" >&2; exit 143' TERM
+trap 'echo "$prog: interrupted, $output may be incomplete" >&3; exit 130' INT
+trap 'echo "$prog: terminated, $output may be incomplete" >&3; exit 143' TERM
 
 if [ -z "$only" ]; then
     run_vineflower "${extra[@]}" "$input" "$output"
@@ -202,12 +246,14 @@ else
 
     # Vineflower 1.12.0 can crash here (NoSuchFileException) when the classes sit
     # under BOOT-INF/classes, so keep its errors until we know the fallback is needed.
-    if run_vineflower --only="$only" "${extra[@]}" "$input" "$output" 2>"$tmp/vineflower.err" \
+    # Extra options must come before --only: Vineflower 1.12.0 reads anything after
+    # it as an input path and ignores it ("warn: missing ...").
+    if run_vineflower "${extra[@]}" --only="$only" "$input" "$output" 2>"$tmp/vineflower.err" \
         && [ "$(count_java "$output")" -gt 0 ]; then
         :
     elif [ -f "$input" ] && command -v unzip >/dev/null 2>&1 && unzip -tqq "$input" >/dev/null 2>&1; then
         echo "$prog: --only=$only failed or found nothing, extracting matching entries" >&2
-        find "$output" -mindepth 1 -delete
+        clear_output
 
         # Usually only one of the three layouts exists. unzip then exits with 11
         # and prints "filename not matched" for the others, so that is not an error.
