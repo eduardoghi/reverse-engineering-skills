@@ -43,3 +43,7 @@ java-decompile --check
 
 `--clean` only empties directories that java-decompile created or initialized while they were empty
 (they have a `.java-decompile-output` marker). It refuses any other non-empty folder.
+
+## License
+
+MIT, see `LICENSE`.
