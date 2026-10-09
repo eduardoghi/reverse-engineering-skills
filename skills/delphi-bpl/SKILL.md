@@ -130,6 +130,17 @@ plugin, and Ghidra 12.1.3 or newer with the ReVa extension for long sessions.
    argument order, and always when the decompiled output has `unkfloat10`, `in_EAX` or stack variables
    with no clear source. Quote the address and instruction for each conclusion.
 
+9. **Check the conclusion against what the program does** when it depends on a runtime value (a
+   setting, a record, a mode flag) or when someone will act on it. Look for the effect in the data the
+   program writes, or run the smallest input that takes the branch in question. When the reading and
+   the observed behaviour disagree, one of the assumptions is wrong. Say so and find which one instead
+   of reporting either result.
+
+   A branch that depends on a setting read by name needs two answers: where stored values come from
+   and what the default is. The loader's query or file read gives the first. The default is usually
+   an argument of the call that registers the setting, so search for the setting's name and read the
+   arguments around that call. When no stored value exists, the default applies.
+
 ## Reading Delphi code
 
 - **Mangled names.** `@Unit@TClass@Method$qqr<params>`. `$qqr` is the register convention, `$qqs`
@@ -157,6 +168,31 @@ plugin, and Ghidra 12.1.3 or newer with the ReVa extension for long sessions.
   offset each one touches.
 - **Unit initialization** is in `@Unit@initialization$qqrv` and `@Unit@Finalization$qqrv`. Global
   registrations (class factories, lookup tables) often happen there.
+- **try blocks** start with `xor eax, eax; push ebp; push <handler>; push dword fs:[eax];
+  mov fs:[eax], esp` and end by restoring `fs:[0]`. The handler jumps to `@System@@HandleFinally`
+  for try/finally and to `@System@@HandleAnyException` or `@System@@HandleOnException` for
+  try/except. When a literal shows up only in the except block, usually in an error message that
+  names the operation, the code you want is the protected block right before it. Script interpreters
+  embedded in Delphi programs often dispatch built-in functions this way, so the function's name
+  leads to its error handler and the implementation sits just above.
+- **Floating point width.** `fld`/`fstp` with `tbyte` is `Extended` (10 bytes), `qword` is `Double`
+  and `dword` is `Single`. A value that passes through a `Double` parameter or result is no longer
+  equal to the same decimal literal held as `Extended`. Compare against a small range when a test
+  checks a computed float.
+- **Reference counting bugs.** Assigning a string goes through `@System@@LStrAsg` (or `UStrAsg`),
+  which adds a reference. A plain `mov [obj + x], reg` of a string pointer does not. If the source
+  is then released with `LStrClr` or `LStrArrayClr` before the field is used, the field points at
+  freed memory and the result depends on whether that memory was reused. Interface variables are
+  released with `@System@@IntfClear`. `TObject.Free` or `FreeAndNil` on one calls through the wrong
+  table and usually crashes. An object created and then overwritten without a `Free` is a leak.
+
+## Comparing two builds
+
+Export names stay the same between builds of a package and addresses don't. Match exported
+functions by name, and nested procedures through the literals they reference (`bpl-xref str` on
+both files). Then compare only the instructions the question depends on. A function that was
+rewritten may also have been renamed or split, so when an export disappears, look for the same
+literals in the new file before concluding the code is gone.
 
 ## Ghidra and ReVa
 
