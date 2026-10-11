@@ -14,8 +14,9 @@ Skills and helper scripts for Claude Code reverse-engineering work. New skills g
 - `bin/java-decompile`: wrapper around Vineflower used by the `java-decompile` skill. Run it with `--help`
   for the options.
 - `bin/bpl-xref`: cross-references for 32-bit PE files, used by the `delphi-bpl` skill. Finds the code
-  that uses a string literal (`str`), the calls and pointers to an address (`calls`), and prints rizin
-  flags that name import thunks and string literals in the disassembly (`flags`).
+  that uses a string literal (`str`), the calls and pointers to an address (`calls`), prints rizin
+  flags that name import thunks and string literals in the disassembly (`flags`), and reads the form
+  resources to map each event to its method (`dfm`).
 
 ## Setup
 
@@ -57,6 +58,8 @@ java-decompile --check
 bpl-xref str app.bpl 'CustomerName' 'Invalid order'
 bpl-xref calls app.bpl 0x0045a1c0
 bpl-xref flags app.bpl 0x0045a1c0 0x0045b000 > flags.rz
+bpl-xref dfm app.bpl TFORDEREDIT
+bpl-xref dfm --events app.bpl
 ```
 
 `--clean` only empties directories that java-decompile created or initialized while they were empty

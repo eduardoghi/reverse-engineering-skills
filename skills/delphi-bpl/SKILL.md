@@ -49,7 +49,24 @@ plugin, and Ghidra 12.1.3 or newer with the ReVa extension for long sessions.
    An EXE usually has no exports, so there are no "prev"/"next" lines. Start from the entry point
    (`rz-bin -e app.exe`) and from the import thunks, which `flags` names.
 
-3. **Find who calls a function**, especially a nested procedure, which has no export and no name:
+3. **Go from a screen to the code** when you know what the user clicks but not which method runs.
+   Delphi stores each form as a binary DFM in an RCDATA resource named after the form class, and the
+   form maps every event to a method name.
+
+   ```sh
+   bpl-xref dfm app.bpl                          # every form, its class and number of events
+   bpl-xref dfm app.bpl TFORDEREDIT              # one form as text .dfm
+   bpl-xref dfm --events app.bpl | grep -i -A1 'btnSave'
+   ```
+
+   Find the form by a caption or label in the text output, then take the component's `OnClick`,
+   `OnChange` or other event. `--events` prints each handler with the exported method it names
+   (`@Unit@TForm@BtnSaveClick$qqrp14System@TObject`), so the address is ready for steps 4 to 6.
+   Events inside collection items show up as `Edit1.Buttons[0].OnClick`. A handler marked `?` was
+   not found in the form's class, usually because an ancestor form declares it, and every method
+   with that name is listed as a candidate.
+
+4. **Find who calls a function**, especially a nested procedure, which has no export and no name:
 
    ```sh
    bpl-xref calls app.bpl 0x0045a1c0 '@Uorders@TOrder@Post$qqrv'
@@ -61,7 +78,7 @@ plugin, and Ghidra 12.1.3 or newer with the ReVa extension for long sessions.
    interface calls go through `call dword [reg + offset]` and don't show up. For those, find the VMT
    slot that points at the method (a `ptr` hit) and search for its offset.
 
-4. **Read the disassembly with names.** Plain `pd` shows `call 0x00401f30` and `mov edx, 0x0045c6fc`.
+5. **Read the disassembly with names.** Plain `pd` shows `call 0x00401f30` and `mov edx, 0x0045c6fc`.
    Generate rizin flags for the import thunks and for the string literals the range uses, then save
    the disassembly to a file:
 
@@ -95,7 +112,7 @@ plugin, and Ghidra 12.1.3 or newer with the ReVa extension for long sessions.
    For a quick look at a wide range without names, `objdump -d -M intel --no-show-raw-insn
    --start-address=0x0045a1c0 --stop-address=0x0045b000 app.bpl` takes a fraction of a second.
 
-5. **Decompile one function with rz-ghidra** when the control flow is hard to follow in the
+6. **Decompile one function with rz-ghidra** when the control flow is hard to follow in the
    disassembly. A small function takes a few seconds, a 2,000-instruction one around 20.
 
    ```sh
@@ -105,7 +122,7 @@ plugin, and Ghidra 12.1.3 or newer with the ReVa extension for long sessions.
 
    `analysis.cc=borland` only changes `pdg`. `pd` and `pD` ignore it.
 
-6. **Make register arguments visible.** Calls to other Delphi functions come out as `Foo()` with no
+7. **Make register arguments visible.** Calls to other Delphi functions come out as `Foo()` with no
    arguments, because the arguments travel in `eax`, `edx` and `ecx`. Give the callee a signature with
    `afs`, keeping `-e analysis.cc=borland` on the command line:
 
@@ -122,24 +139,24 @@ plugin, and Ghidra 12.1.3 or newer with the ReVa extension for long sessions.
    rz-ghidra warns `Matching calling convention borland ... failed, args may be inaccurate`, which is
    expected. `double` arguments are still shown as two `uStack_*` stores before the call.
 
-7. **Use Ghidra with ReVa for anything longer** than a few functions: cross-references across the
+8. **Use Ghidra with ReVa for anything longer** than a few functions: cross-references across the
    whole file, call graphs, renaming as you go. See the Ghidra section for import and the time it
    takes.
 
-8. **Confirm in the disassembly** when a conclusion depends on a branch, an offset, a constant or the
+9. **Confirm in the disassembly** when a conclusion depends on a branch, an offset, a constant or the
    argument order, and always when the decompiled output has `unkfloat10`, `in_EAX` or stack variables
    with no clear source. Quote the address and instruction for each conclusion.
 
-9. **Check the conclusion against what the program does** when it depends on a runtime value (a
-   setting, a record, a mode flag) or when someone will act on it. Look for the effect in the data the
-   program writes, or run the smallest input that takes the branch in question. When the reading and
-   the observed behaviour disagree, one of the assumptions is wrong. Say so and find which one instead
-   of reporting either result.
+10. **Check the conclusion against what the program does** when it depends on a runtime value (a
+    setting, a record, a mode flag) or when someone will act on it. Look for the effect in the data the
+    program writes, or run the smallest input that takes the branch in question. When the reading and
+    the observed behaviour disagree, one of the assumptions is wrong. Say so and find which one instead
+    of reporting either result.
 
-   A branch that depends on a setting read by name needs two answers: where stored values come from
-   and what the default is. The loader's query or file read gives the first. The default is usually
-   an argument of the call that registers the setting, so search for the setting's name and read the
-   arguments around that call. When no stored value exists, the default applies.
+    A branch that depends on a setting read by name needs two answers: where stored values come from
+    and what the default is. The loader's query or file read gives the first. The default is usually
+    an argument of the call that registers the setting, so search for the setting's name and read the
+    arguments around that call. When no stored value exists, the default applies.
 
 ## Reading Delphi code
 

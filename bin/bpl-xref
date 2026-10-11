@@ -4,6 +4,7 @@
   bpl-xref str FILE STRING...         code that references a string literal
   bpl-xref calls FILE ADDR|EXPORT...  calls, jumps and pointers to an address
   bpl-xref flags FILE [START END]     rizin flags for import thunks and literals
+  bpl-xref dfm FILE [FORM...]         list form resources or print them as text
 
 Each reference in code shows the nearest function prologue before it
 (push ebp; mov ebp, esp) and the exported functions around it. Nested
@@ -15,6 +16,7 @@ references, which drops numbers that happen to have the same value.
 """
 import argparse
 import bisect
+import math
 import re
 import struct
 import sys
@@ -28,6 +30,9 @@ PROLOGUE = b"\x55\x8b\xec"
 IMAGE_SCN_MEM_EXECUTE = 0x20000000
 IMAGE_REL_BASED_HIGHLOW = 3
 MAX_LITERAL = 1 << 16
+RT_RCDATA = 10
+DFM_SIGNATURE = b"TPF0"
+MAX_CANDIDATES = 10
 
 
 def safe(text):
@@ -40,7 +45,7 @@ def safe(text):
 
 
 class Image:
-    def __init__(self, path):
+    def __init__(self, path, allow_64=False):
         # pefile stops at 8192 exports by default and treats the rest as
         # corrupt. Delphi packages export every unit symbol and easily pass
         # that (60k+ in large BPLs). The limit has to go to the constructor,
@@ -49,7 +54,9 @@ class Image:
             pe = pefile.PE(path, fast_load=True, max_symbol_exports=1 << 20)
         except pefile.PEFormatError as e:
             sys.exit(f"bpl-xref: {path}: not a PE file ({e})")
-        if pe.OPTIONAL_HEADER.Magic != pefile.OPTIONAL_HEADER_MAGIC_PE:
+        # Form resources don't depend on the architecture, so `dfm` reads
+        # 64-bit files too.
+        if pe.OPTIONAL_HEADER.Magic != pefile.OPTIONAL_HEADER_MAGIC_PE and not allow_64:
             sys.exit(f"bpl-xref: {path}: 64-bit PE, only 32-bit code uses absolute pointers")
         pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_EXPORT"]])
         self.pe = pe
@@ -252,6 +259,27 @@ class Image:
             desc += 20
         return slots
 
+    def form_resources(self):
+        """Return (resource name, bytes) for each RCDATA resource holding a binary form."""
+        self.pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_RESOURCE"]])
+        forms = []
+        root = getattr(self.pe, "DIRECTORY_ENTRY_RESOURCE", None)
+        for rtype in root.entries if root else []:
+            if rtype.id != RT_RCDATA or not hasattr(rtype, "directory"):
+                continue
+            for entry in rtype.directory.entries:
+                if not hasattr(entry, "directory"):
+                    continue
+                name = str(entry.name) if entry.name else str(entry.id)
+                for lang in entry.directory.entries:
+                    if not hasattr(lang, "data"):
+                        continue
+                    d = lang.data.struct
+                    body = self.pe.get_data(d.OffsetToData, d.Size)
+                    if body.startswith(DFM_SIGNATURE):
+                        forms.append((name, body))
+        return forms
+
     def import_thunks(self):
         """Yield (va, dll, name) for each `jmp dword [iat]` thunk in code."""
         iat = self.import_slots()
@@ -420,6 +448,297 @@ def cmd_flags(img, args):
     print(f"bpl-xref: {thunks} import thunks, {strings} string literals", file=sys.stderr)
 
 
+class DfmError(Exception):
+    pass
+
+
+class DfmReader:
+    """Reader for binary form resources (TPF0), the format TReader loads.
+
+    Each object is optional filer flags, class name, object name, properties
+    up to a zero byte and child objects up to another zero byte. Each property
+    is a name and a typed value.
+    """
+
+    MAX_DEPTH = 64
+    FLAG_INHERITED, FLAG_CHILD_POS, FLAG_INLINE = 1, 2, 4
+
+    def __init__(self, data):
+        self.data = data
+        self.pos = len(DFM_SIGNATURE)
+
+    def take(self, n):
+        if n < 0 or self.pos + n > len(self.data):
+            raise DfmError(f"truncated at byte {self.pos}")
+        chunk = self.data[self.pos:self.pos + n]
+        self.pos += n
+        return chunk
+
+    def peek(self):
+        if self.pos >= len(self.data):
+            raise DfmError(f"truncated at byte {self.pos}")
+        return self.data[self.pos]
+
+    def unpack(self, fmt):
+        return struct.unpack(fmt, self.take(struct.calcsize(fmt)))[0]
+
+    def short_string(self):
+        return self.take(self.unpack("<B")).decode("latin-1")
+
+    def read_object(self, depth=0):
+        if depth > self.MAX_DEPTH:
+            raise DfmError(f"objects nested deeper than {self.MAX_DEPTH} at byte {self.pos}")
+        flags, child_pos = 0, None
+        if self.peek() & 0xF0 == 0xF0:
+            flags = self.unpack("<B") & 0x0F
+            if flags & self.FLAG_CHILD_POS:
+                child_pos = self.read_value(depth)[1]
+        obj = {"flags": flags, "child_pos": child_pos, "class": self.short_string(),
+               "name": self.short_string(), "props": [], "children": []}
+        while self.peek():
+            obj["props"].append((self.short_string(), self.read_value(depth)))
+        self.pos += 1
+        while self.peek():
+            obj["children"].append(self.read_object(depth + 1))
+        self.pos += 1
+        return obj
+
+    def read_value(self, depth):
+        """Return (kind, value) for the next typed value."""
+        if depth > self.MAX_DEPTH:
+            raise DfmError(f"values nested deeper than {self.MAX_DEPTH} at byte {self.pos}")
+        at = self.pos
+        t = self.unpack("<B")
+        if t == 1:
+            items = []
+            while self.peek():
+                items.append(self.read_value(depth + 1))
+            self.pos += 1
+            return "list", items
+        if t in (2, 3, 4, 19):
+            return "int", self.unpack({2: "<b", 3: "<h", 4: "<i", 19: "<q"}[t])
+        if t == 5:
+            return "float", extended_to_float(self.take(10))
+        if t in (6, 7):
+            return ("str" if t == 6 else "ident"), self.short_string()
+        if t in (8, 9):
+            return "ident", "True" if t == 9 else "False"
+        if t == 10:
+            return "binary", self.take(self.unpack("<i"))
+        if t == 11:
+            names = []
+            while self.peek():
+                names.append(self.short_string())
+            self.pos += 1
+            return "set", names
+        if t == 12:
+            return "str", self.take(self.unpack("<i")).decode("latin-1")
+        if t == 13:
+            return "ident", "nil"
+        if t == 14:
+            items = []
+            while self.peek():
+                index = self.read_value(depth + 1)[1] if self.peek() in (2, 3, 4) else None
+                if self.unpack("<B") != 1:
+                    raise DfmError(f"collection item without a property list at byte {self.pos - 1}")
+                props = []
+                while self.peek():
+                    props.append((self.short_string(), self.read_value(depth + 1)))
+                self.pos += 1
+                items.append((index, props))
+            self.pos += 1
+            return "collection", items
+        if t in (15, 21):
+            return "float", self.unpack("<f" if t == 15 else "<d")
+        if t == 16:
+            return "float", self.unpack("<q") / 10000
+        if t == 17:
+            return "float", self.unpack("<d")
+        if t == 18:
+            return "str", self.take(2 * self.unpack("<i")).decode("utf-16-le", "replace")
+        if t == 20:
+            return "str", self.take(self.unpack("<i")).decode("utf-8", "replace")
+        raise DfmError(f"unknown value type {t} at byte {at}")
+
+
+def extended_to_float(raw):
+    """Convert an 80-bit Extended to a Python float."""
+    mantissa = int.from_bytes(raw[:8], "little")
+    exponent = int.from_bytes(raw[8:], "little")
+    sign = -1.0 if exponent & 0x8000 else 1.0
+    exponent &= 0x7FFF
+    if exponent == 0x7FFF:
+        return sign * float("inf") if mantissa << 1 == 0 else float("nan")
+    try:
+        return sign * math.ldexp(mantissa, exponent - 16383 - 63)
+    except OverflowError:
+        return sign * float("inf")
+
+
+def dfm_quote(text):
+    """Quote a string the way text DFM files do, with #nn for unprintable characters."""
+    out, quoted = [], False
+    for c in text:
+        if c.isprintable():
+            if not quoted:
+                out.append("'")
+                quoted = True
+            out.append("''" if c == "'" else c)
+        else:
+            if quoted:
+                out.append("'")
+                quoted = False
+            out.append(f"#{ord(c)}")
+    if quoted:
+        out.append("'")
+    return "".join(out) or "''"
+
+
+def dfm_value(kind, value, indent):
+    """Return the text lines for a value. The first line continues `Name = `."""
+    pad = "  " * indent
+    if kind == "int":
+        return [str(value)]
+    if kind == "float":
+        return [repr(value)]
+    if kind == "str":
+        return [dfm_quote(value)]
+    if kind == "ident":
+        return [safe(value)]
+    if kind == "set":
+        return ["[" + ", ".join(safe(n) for n in value) + "]"]
+    if kind == "binary":
+        return [f"{{{len(value)} bytes of binary data}}"]
+    if kind == "list":
+        lines = ["("]
+        for k, v in value:
+            sub = dfm_value(k, v, indent + 1)
+            lines.append(f"{pad}  {sub[0]}")
+            lines.extend(sub[1:])
+        lines[-1] += ")"
+        return lines
+    lines = ["<"]
+    for index, props in value:
+        lines.append(f"{pad}  item" + (f" [{index}]" if index is not None else ""))
+        lines.extend(dfm_props(props, indent + 2))
+        lines.append(f"{pad}  end")
+    lines[-1] += ">"
+    return lines
+
+
+def dfm_props(props, indent):
+    lines = []
+    for name, (kind, value) in props:
+        sub = dfm_value(kind, value, indent)
+        lines.append(f"{'  ' * indent}{safe(name)} = {sub[0]}")
+        lines.extend(sub[1:])
+    return lines
+
+
+def dfm_text(obj, indent=0):
+    """Print an object tree in the layout of a text DFM file."""
+    pad = "  " * indent
+    keyword = ("inline" if obj["flags"] & DfmReader.FLAG_INLINE
+               else "inherited" if obj["flags"] & DfmReader.FLAG_INHERITED else "object")
+    pos = f" [{obj['child_pos']}]" if obj["child_pos"] is not None else ""
+    lines = [f"{pad}{keyword} {safe(obj['name'])}: {safe(obj['class'])}{pos}"]
+    lines.extend(dfm_props(obj["props"], indent + 1))
+    for child in obj["children"]:
+        lines.extend(dfm_text(child, indent + 1))
+    lines.append(f"{pad}end")
+    return lines
+
+
+def dfm_events(obj, owner=None):
+    """Yield (owner class, component, event, handler) for each event property.
+
+    Handlers are methods of the class that owns the form, or of a frame when
+    the component sits inside an inline frame.
+    """
+    if owner is None or obj["flags"] & DfmReader.FLAG_INLINE:
+        owner = obj["class"]
+    for comp, event, handler in prop_events(obj["name"], obj["props"]):
+        yield owner, comp, event, handler
+    for child in obj["children"]:
+        yield from dfm_events(child, owner)
+
+
+def prop_events(path, props):
+    """Yield (path, event, handler) from properties, including collection items."""
+    for name, (kind, value) in props:
+        if name.startswith("On") and kind == "ident" and value != "nil":
+            yield path, name, value
+        elif kind == "collection":
+            for i, (_index, item) in enumerate(value):
+                yield from prop_events(f"{path}.{name}[{i}]", item)
+
+
+def method_index(img):
+    """Map lowercase (class, method) and method alone to exported functions."""
+    by_class, by_method = {}, {}
+    for va, name in img.funcs:
+        m = re.match(r"@[^@]+@([^@$]+)@([^@$]+)\$", name)
+        if m:
+            cls, method = m.group(1).lower(), m.group(2).lower()
+            by_class.setdefault((cls, method), []).append((va, name))
+            by_method.setdefault(method, []).append((va, name))
+    return by_class, by_method
+
+
+def cmd_dfm(img, args):
+    forms = []
+    for res, body in img.form_resources():
+        try:
+            forms.append((res, len(body), DfmReader(body).read_object(), None))
+        except DfmError as e:
+            forms.append((res, len(body), None, str(e)))
+    if not forms:
+        sys.exit("bpl-xref: no form resources (RCDATA starting with TPF0)")
+
+    if args.forms:
+        wanted = {f.lower() for f in args.forms}
+        selected = [f for f in forms
+                    if f[0].lower() in wanted or (f[2] and {f[2]["class"].lower(), f[2]["name"].lower()} & wanted)]
+        if not selected:
+            sys.exit("bpl-xref: no form with that resource, class or object name (run without FORM to list them)")
+    elif args.events:
+        selected = forms
+    else:
+        for res, size, obj, err in forms:
+            if obj:
+                n = sum(1 for _ in dfm_events(obj))
+                print(f"{safe(res)}  {safe(obj['name'])}: {safe(obj['class'])}  {size} bytes  {n} events")
+            else:
+                print(f"{safe(res)}  {size} bytes  unreadable: {err}")
+        return
+
+    by_class, by_method = method_index(img) if args.events else ({}, {})
+    for res, size, obj, err in selected:
+        if not obj:
+            print(f"{safe(res)}: unreadable: {err}")
+            continue
+        if not args.events:
+            print("\n".join(dfm_text(obj)))
+            continue
+        for owner, comp, event, handler in dfm_events(obj):
+            exact = by_class.get((owner.lower(), handler.lower()))
+            print(f"{safe(res)}  {safe(comp)}.{safe(event)} = {safe(handler)}")
+            if exact:
+                for va, name in exact:
+                    print(f"    0x{va:08x} {safe(name)}")
+                continue
+            # A handler missing from the owner class is usually inherited from
+            # an ancestor form. Any method with that name is a candidate, and
+            # common names such as FormShow can have hundreds.
+            cands = by_method.get(handler.lower(), [])
+            for va, name in cands[:MAX_CANDIDATES]:
+                print(f"    ? 0x{va:08x} {safe(name)}")
+            if len(cands) > MAX_CANDIDATES:
+                print(f"    ? {len(cands) - MAX_CANDIDATES} more, find the ancestor form's class to pick one")
+            if not cands:
+                print("    no exported method with that name")
+
+
 def main():
     head, tail = __doc__.split("\n\n", 1)
     ap = argparse.ArgumentParser(prog="bpl-xref", description=head, epilog=tail,
@@ -453,6 +772,18 @@ def main():
     p.add_argument("end", nargs="?", help="end of the code range (hex, exclusive)")
     p.set_defaults(func=cmd_flags)
 
+    p = sub.add_parser("dfm", help="list form resources or print them as text",
+                       description="Read binary form resources (RCDATA that starts with TPF0). "
+                                   "Without FORM, list every form with its class and number of event "
+                                   "handlers. With FORM, print it in the layout of a text .dfm file. "
+                                   "With --events, print each event handler and the exported method "
+                                   "it names, for the given forms or for all of them. Binary "
+                                   "properties such as images are shown only by size.")
+    p.add_argument("file")
+    p.add_argument("forms", nargs="*", metavar="form", help="resource, class or object name (any case)")
+    p.add_argument("--events", action="store_true", help="print event handlers and their methods")
+    p.set_defaults(func=cmd_dfm)
+
     args = ap.parse_args()
     if args.cmd == "flags":
         if bool(args.start) != bool(args.end):
@@ -462,7 +793,7 @@ def main():
                 ap.error("flags: END must be greater than START")
         except ValueError:
             ap.error("flags: START and END must be hex addresses")
-    args.func(Image(args.file), args)
+    args.func(Image(args.file, allow_64=args.cmd == "dfm"), args)
 
 
 if __name__ == "__main__":
