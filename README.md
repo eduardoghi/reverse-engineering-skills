@@ -52,7 +52,7 @@ Requirements for `delphi-bpl`:
 Requirements for `binary-diff`:
 
 - Ghidra 12.1.3 or newer, with the PyGhidra wheel it ships
-- Python 3.13 or older for ghidriff (`uv` makes the venv, see the skill) and `jq` to read its JSON
+- `uv` to install the ghidriff fork into its own venv (see the skill) and `jq` to read its JSON
 
 ## Examples
 

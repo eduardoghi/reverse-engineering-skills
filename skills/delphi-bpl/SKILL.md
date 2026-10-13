@@ -214,8 +214,8 @@ literals in the new file before concluding the code is gone.
 To see everything that changed between two builds, run ghidriff as described in the `binary-diff`
 skill. On a BPL it matches most functions by their export names. Filter the JSON by unit
 (`test("@Unitname@")`) to find what changed in the area you care about. The exported RTTI
-(`@$xp$...`) and VMTs (`@Unit@TClass@`) come out as functions that fail to decompile, which is
-expected. That failure is what crashes ghidriff on Python 3.14.
+(`@$xp$...`) and VMTs (`@Unit@TClass@`) come out as functions that fail to decompile or decompile
+to nonsense, and many of them land in `modified`. Skip names that start with `@$xp$`.
 
 ## Ghidra and ReVa
 
