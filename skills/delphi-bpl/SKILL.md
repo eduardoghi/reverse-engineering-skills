@@ -211,6 +211,12 @@ both files). Then compare only the instructions the question depends on. A funct
 rewritten may also have been renamed or split, so when an export disappears, look for the same
 literals in the new file before concluding the code is gone.
 
+To see everything that changed between two builds, run ghidriff as described in the `binary-diff`
+skill. On a BPL it matches most functions by their export names. Filter the JSON by unit
+(`test("@Unitname@")`) to find what changed in the area you care about. The exported RTTI
+(`@$xp$...`) and VMTs (`@Unit@TClass@`) come out as functions that fail to decompile, which is
+expected. That failure is what crashes ghidriff on Python 3.14.
+
 ## Ghidra and ReVa
 
 - **Use Ghidra 12.1.3 or newer.** Up to 12.1.2 the PE loader read the export ordinal table as signed

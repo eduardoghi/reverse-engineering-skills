@@ -8,6 +8,8 @@ Skills and helper scripts for Claude Code reverse-engineering work. New skills g
   `javap` bytecode to settle disagreements.
 - `skills/delphi-bpl`: reverse engineer 32-bit Delphi packages and binaries, from exported names and
   string literals to decompiled functions with rz-ghidra or Ghidra and ReVa.
+- `skills/binary-diff`: compare two builds of a native binary with ghidriff and read which functions
+  were added, removed or changed.
 
 ## Scripts
 
@@ -29,6 +31,7 @@ ln -sfn "$PWD/skills/java-decompile" ~/.claude/skills/java-decompile
 ln -sfn "$PWD/bin/java-decompile" ~/.local/bin/java-decompile
 ln -sfn "$PWD/skills/delphi-bpl" ~/.claude/skills/delphi-bpl
 ln -sfn "$PWD/bin/bpl-xref" ~/.local/bin/bpl-xref
+ln -sfn "$PWD/skills/binary-diff" ~/.claude/skills/binary-diff
 java-decompile --check
 bpl-xref --help > /dev/null && echo 'bpl-xref ok'   # fails if pefile is missing
 ```
@@ -45,6 +48,11 @@ Requirements for `delphi-bpl`:
 - Python 3 with `pefile` (`pacman -S python-pefile`)
 - rizin with the rz-ghidra plugin (`pacman -S rizin rz-ghidra`)
 - Optional, for long sessions: Ghidra 12.1.3 or newer and the ReVa extension
+
+Requirements for `binary-diff`:
+
+- Ghidra 12.1.3 or newer, with the PyGhidra wheel it ships
+- Python 3.13 or older for ghidriff (`uv` makes the venv, see the skill) and `jq` to read its JSON
 
 ## Examples
 
