@@ -217,6 +217,50 @@ skill. On a BPL it matches most functions by their export names. Filter the JSON
 (`@$xp$...`) and VMTs (`@Unit@TClass@`) come out as functions that fail to decompile or decompile
 to nonsense, and many of them land in `modified`. Skip names that start with `@$xp$`.
 
+## Inspecting a running process
+
+When the code reads the same in every build and the behaviour still differs, look at the objects in
+memory. On Linux, including programs running under Wine, `/proc/PID/mem` can be read from Python
+without attaching a debugger, and the process keeps running.
+
+```python
+mem = open(f'/proc/{pid}/mem', 'rb', 0)
+for line in open(f'/proc/{pid}/maps'):
+    lo, hi = (int(x, 16) for x in line.split()[0].split('-'))
+    if 'r' not in line.split()[1] or lo >= 0x80000000:
+        continue
+    try:
+        mem.seek(lo); data = mem.read(hi - lo)
+    except OSError:
+        continue      # guard pages and unreadable mappings
+    ...
+```
+
+- Reading another process needs ptrace permission. With `kernel.yama.ptrace_scope = 1` (the usual
+  default) only a parent can read its child, and the read fails with `Permission denied`. Set it to
+  0 with `sudo sysctl kernel.yama.ptrace_scope=0` for the session and back to 1 when done.
+- The first dword of every Delphi object is its class pointer, which is the address of the exported
+  VMT symbol `@Unit@TClass@` (adjusted by the rebase delta if the package didn't load at its
+  preferred base, which `/proc/PID/maps` shows). Scanning readable memory for aligned dwords equal
+  to that address lists the instances. Expect false hits inside the VMT itself, in RTTI and in freed
+  objects, so check a few fields before trusting one.
+- To find which field holds a sub-object when you don't know the offset, scan the object for
+  pointers whose target starts with the VMT of the class you expect. Then read the container. Get the
+  layout from the getters (`TList.GetCount`, `TCollection.GetCount`) in the build you are looking
+  at, since field offsets change between compiler versions.
+- An AnsiString field points at the first character, with the length in the dword before it and the
+  reference count before that.
+- Comparing instances answers questions that the code alone doesn't. For example, when the same data
+  exists in a runtime object and in an edit copy, counting the items each one holds shows which copy
+  lost them.
+
+Debuggers under Wine are fragile. `winedbg --gdb` on a 32-bit program in Wine's new WoW64 mode
+reports the target as i386, but its break-in thread runs at a 64-bit address. gdb truncates that
+address, reports a SIGSEGV, and detaching then can leave the program dead or frozen. The gdb proxy
+also accepts a single connection, so a failed session can't be resumed. Prefer reading memory as
+above, or a GUI debugger such as x32dbg running inside the same Wine prefix, and warn whoever is
+using the program that it may close.
+
 ## Ghidra and ReVa
 
 - **Use Ghidra 12.1.3 or newer.** Up to 12.1.2 the PE loader read the export ordinal table as signed
