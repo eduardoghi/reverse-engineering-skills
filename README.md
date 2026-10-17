@@ -10,6 +10,8 @@ Skills and helper scripts for Claude Code reverse-engineering work. New skills g
   string literals to decompiled functions with rz-ghidra or Ghidra and ReVa.
 - `skills/binary-diff`: compare two builds of a native binary with ghidriff and read which functions
   were added, removed or changed.
+- `skills/binary-patch`: patch the machine code of a 32-bit PE file in place, add new code through
+  trampolines in unused space, test it with unicorn and describe the patch as byte patterns.
 
 ## Scripts
 
@@ -32,6 +34,7 @@ ln -sfn "$PWD/bin/java-decompile" ~/.local/bin/java-decompile
 ln -sfn "$PWD/skills/delphi-bpl" ~/.claude/skills/delphi-bpl
 ln -sfn "$PWD/bin/bpl-xref" ~/.local/bin/bpl-xref
 ln -sfn "$PWD/skills/binary-diff" ~/.claude/skills/binary-diff
+ln -sfn "$PWD/skills/binary-patch" ~/.claude/skills/binary-patch
 java-decompile --check
 bpl-xref --help > /dev/null && echo 'bpl-xref ok'   # fails if pefile is missing
 ```
@@ -53,6 +56,11 @@ Requirements for `binary-diff`:
 
 - Ghidra 12.1.3 or newer, with the PyGhidra wheel it ships
 - `uv` to install the ghidriff fork into its own venv (see the skill) and `jq` to read its JSON
+
+Requirements for `binary-patch`:
+
+- Python 3 with `pefile`
+- `unicorn` in a venv, to run the new code before patching (`pip install unicorn`)
 
 ## Examples
 
