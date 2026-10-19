@@ -196,6 +196,27 @@ plugin, and Ghidra 12.1.3 or newer with the ReVa extension for long sessions.
   and `dword` is `Single`. A value that passes through a `Double` parameter or result is no longer
   equal to the same decimal literal held as `Extended`. Compare against a small range when a test
   checks a computed float.
+- **Class references.** A `mov eax, [abs]` before a constructor, an `IsClass` or a factory call loads a
+  class pointer from a cell. For an imported class the cell is the import slot. For a class defined in
+  the package the cell is the `vmtSelfPtr` at VMT minus 0x4C, which holds the VMT's own address, and the
+  class name is the ShortString just before the VMT. The class pointer is the VMT address.
+  `IsClass(obj, cls)` takes the object in `eax` and the class in `edx` and answers in `al`.
+- **Library objects that the package doesn't import methods for.** The fields of VCL classes sit at fixed
+  offsets for a given compiler, so code you inject can read them directly. In the Delphi 7 era layout a
+  `TTreeNode` has the text at +8 and `Data` at +0xC, and a `TStrings` descendant answers `IndexOf`, `Add`
+  and `Delete` through virtual slots. Confirm each offset in code that already touches it (a handler that
+  reads `[node+0xC]` before using `Data`) rather than trusting a table.
+- **Exceptions with extra fields.** In an `on E: Exception do` handler the exception object is kept in a
+  frame slot, saved right after the handler starts (`mov [ebp-0x30], eax`). A factory such as
+  `CreateDet(cls, message, details)` stores the extra strings in fields after the standard ones. Code that
+  logs only `E.Message` discards the rest, and `@System@@DoneExcept` frees the object, so read the field
+  before that call. Find its offset in the factory, where the extra argument is stored with `LStrAsg`.
+- **Objects created in a loop and kept only under a condition.** A loop that creates an object, hands it
+  to a routine that fills it and adds it to a parent only when it ended up non-empty (`Length > 0`)
+  leaks every empty one, because the path that skips the `Add` has no `Free`. In the disassembly look
+  for a constructor call, then a size test, then a conditional jump over the call that stores the object
+  with nothing that releases it on the other side. Confirm with memory growth per iteration (see below),
+  and after the fix compare the program's output before and after.
 - **Reference counting bugs.** Assigning a string goes through `@System@@LStrAsg` (or `UStrAsg`),
   which adds a reference. A plain `mov [obj + x], reg` of a string pointer does not. If the source
   is then released with `LStrClr` or `LStrArrayClr` before the field is used, the field points at
@@ -253,6 +274,22 @@ for line in open(f'/proc/{pid}/maps'):
 - Comparing instances answers questions that the code alone doesn't. For example, when the same data
   exists in a runtime object and in an edit copy, counting the items each one holds shows which copy
   lost them.
+
+- **Growth per unit of work.** To compare variants of a patched binary, sample the resident size and a
+  counter that a hook increments once per unit, then divide the growth by the units over the same
+  range for every variant. The cost of a unit depends on its content, so the cumulative average of runs
+  of different lengths misleads. One variant looked like 0.77 MB per item that way and was 1.14 over the
+  range the other runs shared. Disabling one callee at a time narrows a leak down quickly, but a variant
+  that skips only the allocation's consumer may not change anything, because the leaked object is created
+  before it.
+- **Where the time goes.** Sampling `/proc/PID/task/TID/stat` (the state letter) and
+  `/proc/PID/task/TID/syscall` shows whether the main thread is running or blocked, and in which system
+  call. `perf record -e cpu-clock:u -g -p PID` counts CPU only, so a program that spends most of its time
+  waiting looks almost idle, and the wall clock is the number that matters to the user. Under Wine the
+  packages have no names in `/proc/PID/maps`. Build the module table by reading the first bytes of each
+  candidate image at its preferred base from `/proc/PID/mem` and comparing the `TimeDateStamp` with the
+  file's header, then name each sampled address with the nearest export from `rz-bin -E`. The
+  `wine-debugging` skill has the rest.
 
 Debuggers under Wine are fragile. `winedbg --gdb` on a 32-bit program in Wine's new WoW64 mode
 reports the target as i386, but its break-in thread runs at a 64-bit address. gdb truncates that

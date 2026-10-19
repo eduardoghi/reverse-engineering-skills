@@ -90,6 +90,27 @@ preferred range is taken, so treat every absolute address as something the loade
   from the same registers, return in the same register, keep `ebx`, `esi`, `edi` and `ebp`, and leave
   the stack balanced. In Delphi's register convention the first three arguments are `eax`, `edx`,
   `ecx`. A Delphi method's Self is `eax`.
+- **Replacing the start of a function.** Overwrite the prologue (`push ebp`, `mov ebp, esp`,
+  `add esp, N`, usually 6 bytes) with a `jmp` and `nop`s. The cave replays those same instructions,
+  does its work and jumps back to the first instruction after the replaced bytes. At that point
+  `eax`, `edx` and `ecx` still hold the arguments, so save what the cave clobbers and restore it before
+  the jump back. Replace whole instructions only, and check that no branch targets the middle of the
+  replaced range.
+- **Constants that the loader relocates.** A class pointer, a table address or an import slot that the
+  code loads with `mov eax, [abs]` is relocated by the loader, so the cave can't hold its own copy of
+  the address. Read the operand of the existing instruction instead. The operand sits inside the
+  code, already relocated, and the cave reaches it with the same `call`/`pop` trick:
+
+  ```asm
+  call next
+  next:
+  pop ebx                        ; ebx = address of next
+  mov eax, [ebx + (OPERAND - next)]   ; the relocated dword, OPERAND = address of the imm32
+  mov eax, [eax]                 ; the value the original instruction would have loaded
+  ```
+
+  Keep `ebx` as the base, since a call to another function clobbers `ecx` and `edx`. Push and pop `ebx`
+  around the cave when the host expects it preserved.
 - **Several patches in one cave.** Give each patch its own fixed part of the cave, for example one
   growing from the start and another placed just before the end of the section, so they can be
   applied in any order and each can be removed alone.
@@ -171,6 +192,14 @@ assert mu.reg_read(UC_X86_REG_ESP) == STACK
 assert mu.reg_read(UC_X86_REG_EBX) == 0x11111111
 ```
 
+- Loops need a high `count` in `emu_start`. A 400 iteration copy loop stops short with the default
+  of a few thousand instructions, and the test then fails on the stack check for the wrong reason.
+- When the cave replays a prologue, the stack after it differs from the entry by the size of the pushes
+  and of `add esp, N`, and `ebp` has changed. Assert those exact values instead of the entry values.
+- To catch leaks, give the hooked allocator and string routines a model with reference counts and
+  assert at the end that only the objects the code meant to keep are alive.
+- Assert that `ebx`, `esi`, `edi` and `ebp` come back unchanged on every exit, including the early exits.
+
 Cover every case the code branches on, such as the empty state, each side of every comparison, the
 exact boundary values and counter wraparound. Hooks only need to map the page of the target, since
 execution never reaches the original code. A hand-written x86 emulator for the same test is a waste
@@ -187,7 +216,43 @@ patched, or unknown, which means another build or a half applied patch).
   matches in many places.
 - A cave is all zeros, which match everywhere. Extend its pattern up to the first non-zero bytes
   after it (often the start of the next section) and check that this anchor is unique.
+- Windows of a few bytes are unique in the file you have and may not be in another build, where the
+  patch would write a jump to a wrong address. Ask for at least 24 to 28 literal bytes.
+- Wildcard every relocated dword in the window. The relocation table lists them (`pefile`,
+  directory 5, type 3).
+- When several independent patches share a file, no window may contain bytes that another patch
+  writes, or the "patched" pattern of one stops matching once the other is applied. Compute the write
+  ranges of all the other patches and make those bytes wildcards in every window.
+- Independent patches that all need a cave can share the large zero run at the end of the code
+  section if each takes its own part of it. One patch anchors at the start of the run, another at the
+  end, and a third can sit in the middle. Its pattern is the last bytes of the code before the run, then
+  as many wildcards as it takes to reach its part, then zeros. The anchor makes it unique and the
+  wildcards make it blind to what the other patches did. State what each patch uses and assert in a
+  test that the ranges don't overlap.
+- A pattern that starts with thousands of zeros makes a naive search compare almost the whole
+  pattern at every zero of a run of megabytes, which is quadratic. Search for the literal window with
+  the most non-zero bytes (16 bytes is enough), then compare the full pattern only where it matches.
+  On a 14 MB file that took a real test from 572 seconds to 31.
 - Test that patches sharing a file apply in both orders, on synthetic data and on the real file.
+
+## When the program dies after patching
+
+A cave that passes the emulator can still take the program down, and a program that exits without a
+message gives nothing to read. Capture what happened before guessing.
+
+- On Linux, `strace -f -qq -o trace.txt -e trace=exit_group,kill,tgkill -e signal=SIGSEGV,SIGKILL,SIGABRT
+  program` records how every process ended. `exit_group(0)` with no signal is a normal exit. A line
+  `+++ killed by SIGSEGV (core dumped) +++` is a native crash, and the `SIGSEGV` lines before it carry
+  `si_addr`. Under Wine, `WINEDEBUG=err+all,+seh` logs every exception the program raises and
+  handles, and `+process` logs the life cycle. Both write to stderr, so redirect it to a file.
+- Bisect by changing one thing at a time while the code path stays the same. A variant that does the
+  same calls but uses a constant instead of the real data tells you whether the logic or the data is
+  at fault.
+- Text that the cave builds and hands to the host's interface can crash the host's text rendering when
+  it holds control characters, such as a line break in a place that expects one line, or a very long
+  string. Replace control characters before handing the text over and cap its length.
+- Keep the exact file that crashed and its hash, and put back the last file that worked before
+  anyone uses the program again.
 
 ## Applying
 
