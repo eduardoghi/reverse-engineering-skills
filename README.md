@@ -60,7 +60,8 @@ Requirements for `binary-diff`:
 Requirements for `binary-patch`:
 
 - Python 3 with `pefile`
-- `unicorn` in a venv, to run the new code before patching (`pip install unicorn`)
+- `keystone` to assemble the new code and `unicorn` to run it before patching
+  (`pacman -S python-keystone python-unicorn` on Arch, or `pip install keystone-engine unicorn` in a venv)
 
 ## Examples
 

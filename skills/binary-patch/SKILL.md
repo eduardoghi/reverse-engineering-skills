@@ -10,8 +10,9 @@ code goes into unused space inside an existing section. Find and understand the 
 `delphi-bpl` skill covers that for Delphi). This skill is about writing the change so it loads, runs
 and can be applied again to another copy of the same build.
 
-The tools are Python 3 with `pefile`, `rizin` or `objdump` to check the result, and `unicorn` to run
-the new code in isolation (`pip install unicorn` in a venv).
+The tools are Python 3 with `pefile`, `keystone` to assemble new code, `rizin` or `objdump` to check
+the result, and `unicorn` to run the new code in isolation. Arch packages them as `python-keystone`
+and `python-unicorn`. Elsewhere use `pip install keystone-engine unicorn` in a venv.
 
 ## Addresses and file offsets
 
@@ -92,6 +93,46 @@ preferred range is taken, so treat every absolute address as something the loade
 - **Several patches in one cave.** Give each patch its own fixed part of the cave, for example one
   growing from the start and another placed just before the end of the section, so they can be
   applied in any order and each can be removed alone.
+
+## Assembling with keystone
+
+Hand-encoded bytes are fine for a 5-byte `jmp`. For anything with branches, write assembly and let
+keystone encode it at the address it will live at, so `call` and `jmp` to absolute targets come out
+as the right `rel32`:
+
+```python
+from keystone import Ks, KS_ARCH_X86, KS_MODE_32
+
+ks = Ks(KS_ARCH_X86, KS_MODE_32)
+
+def assemble(src, addr):
+    code, _ = ks.asm(src, addr)
+    return bytes(code)
+
+code = assemble(f"""
+    push ebx
+    mov ebx, eax
+    test eax, eax
+    je skip
+    call {TARGET:#x}          # rel32 computed from CAVE
+skip:
+    pop ebx
+    jmp {BACK:#x}
+""", CAVE)
+```
+
+- Assemble at the final address. The same source assembled at another address gives different
+  `rel32` values.
+- Comments start with `#`. A `;` separates instructions, so `push ebx ; save` fails with
+  `KS_ERR_ASM_MNEMONICFAIL` on `save`.
+- A memory operand without a register of known size needs `dword ptr`, `word ptr` or `byte ptr`.
+  `cmp [eax], 0` is rejected with `KS_ERR_ASM_INVALIDOPERAND`.
+- A label inside an expression becomes a memory operand. `add edi, DATA - next` assembles as
+  `add edi, dword ptr [...]`, an absolute address that the loader will not relocate. Compute
+  displacements in Python and write them as numbers (`add edi, {DATA - NEXT:#x}`), with `NEXT`
+  taken from the length of the code before it.
+- Disassemble the result with capstone or `rizin` and check that every absolute address in it is
+  one you meant.
 
 ## Testing the new code with unicorn
 
