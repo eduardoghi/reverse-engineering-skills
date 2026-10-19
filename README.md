@@ -12,6 +12,8 @@ Skills and helper scripts for Claude Code reverse-engineering work. New skills g
   were added, removed or changed.
 - `skills/binary-patch`: patch the machine code of a 32-bit PE file in place, add new code through
   trampolines in unused space, test it with unicorn and describe the patch as byte patterns.
+- `skills/wine-debugging`: find why a Windows program is slow or dies under Wine on Linux, measure what
+  a network share and the font engine cost, and capture a silent crash.
 
 ## Scripts
 
@@ -35,6 +37,7 @@ ln -sfn "$PWD/skills/delphi-bpl" ~/.claude/skills/delphi-bpl
 ln -sfn "$PWD/bin/bpl-xref" ~/.local/bin/bpl-xref
 ln -sfn "$PWD/skills/binary-diff" ~/.claude/skills/binary-diff
 ln -sfn "$PWD/skills/binary-patch" ~/.claude/skills/binary-patch
+ln -sfn "$PWD/skills/wine-debugging" ~/.claude/skills/wine-debugging
 java-decompile --check
 bpl-xref --help > /dev/null && echo 'bpl-xref ok'   # fails if pefile is missing
 ```
@@ -62,6 +65,11 @@ Requirements for `binary-patch`:
 - Python 3 with `pefile`
 - `keystone` to assemble the new code and `unicorn` to run it before patching
   (`pacman -S python-keystone python-unicorn` on Arch, or `pip install keystone-engine unicorn` in a venv)
+
+Requirements for `wine-debugging`:
+
+- `strace` and `perf` (`pacman -S strace perf`)
+- `mingw-w64-gcc`, only for the text width measurement
 
 ## Examples
 
