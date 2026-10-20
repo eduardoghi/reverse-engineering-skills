@@ -238,6 +238,32 @@ skill. On a BPL it matches most functions by their export names. Filter the JSON
 (`@$xp$...`) and VMTs (`@Unit@TClass@`) come out as functions that fail to decompile or decompile
 to nonsense, and many of them land in `modified`. Skip names that start with `@$xp$`.
 
+For a first pass over one unit, before running ghidriff, compare its exported functions instruction by
+instruction. Take each export of the unit and the next export as the range, so the nested procedures
+that sit before the next export are included. Disassemble both builds with `objdump`, mask what moves
+between builds, and compare the lists. It takes seconds for a few hundred functions.
+
+```python
+import re, subprocess
+def body(path, start, end):
+    out = subprocess.run(['objdump', '-d', '-M', 'intel', '--no-show-raw-insn',
+                          f'--start-address={start}', f'--stop-address={end}', path],
+                         capture_output=True, text=True).stdout
+    ins = [l.split('\t', 1)[1] for l in out.splitlines() if re.match(r'\s*[0-9a-f]+:\t', l)]
+    ins = [re.sub(r'0x[0-9a-f]{5,}', 'ADDR', i) for i in ins]          # absolute addresses
+    ins = [re.sub(r'([+-])0x[0-9a-f]+\]', r'\1OFF]', i) for i in ins]  # field offsets
+    return [re.sub(r'^(call|j\w+)\s+[0-9a-f]+\b.*', r'\1 X', i) for i in ins]
+```
+
+- Check that the lists are not empty before trusting an "equal". `objdump` prints 8 digit addresses
+  without leading spaces, and a pattern that required them matched nothing, so every function came
+  out "equal" between two builds that had in fact changed.
+- When a class gains fields, every method that touches the fields after the new ones changes its
+  offsets, so almost the whole unit shows up as different with the same function sizes. Masking the
+  displacements removes most of that. What is left at the same size is usually small constants that
+  also moved with the layout. Read the diff of the functions the question depends on before calling
+  the change a logic change, and use ghidriff when you need the full picture.
+
 ## Inspecting a running process
 
 When the code reads the same in every build and the behaviour still differs, look at the objects in
