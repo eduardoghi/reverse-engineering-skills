@@ -64,6 +64,45 @@ Reading the start of each file is slow on a cold cache as well. Time 300 files w
 `read` of a few hundred bytes. On the share used here it was 18 ms per file the first time and 3 ms the
 second. A fix has to avoid the per file work, because mount options don't help.
 
+## Directory listing order
+
+A program that lists a directory with `FindFirstFile`/`FindNextFile` (Delphi `FindFirst`) got the
+entries in alphabetical order under Wine, even when the folder was on btrfs and its subfolders had been
+created in a different order. `ls -U` on the same folder showed the creation order. Wine appears to sort
+the entries the way NTFS returns them, so the order in which you create files or folders can't be used
+to steer a program that processes them in listing order. Rename them instead.
+
+## Driving the user interface
+
+To reproduce a bug or run a test through the screens of a program, `xdotool` sends clicks and keys and
+ImageMagick's `import` captures a window. Wine windows are X11 windows, so this also works in a Wayland
+session through XWayland. Both act on the real mouse and keyboard, so ask the person at the machine to
+leave them alone while a script runs.
+
+```sh
+wmctrl -lG                                       # window ids, titles and geometry
+import -window 0x01a00159 shot.png               # capture one window, without decorations
+xdotool windowactivate --sync 0x01a00159
+xdotool mousemove --window 0x01a00159 205 39 click 1
+xdotool type --delay 40 '1234'; xdotool key Tab
+magick shot.png -crop 900x60+0+500 part.png      # zoom into a region before reading it
+```
+
+- Use coordinates relative to the window (`mousemove --window`) and read them from a capture of that
+  window, where pixel (x, y) of the image is the same point. With display scaling, `wmctrl -lG` and
+  `xdotool getwindowgeometry` report the same window at different absolute positions (4688 against
+  2344 at 200%), so absolute coordinates are easy to get wrong.
+- After every action that can open a message box, list the windows again with `wmctrl -l` and look for a
+  new one before typing anything. A modal dialog takes the keys, and `xdotool getactivewindow` doesn't
+  always return it, so a script that captures "the active window" can miss the dialog and keep typing
+  into the wrong place. Capture the dialog by its id, answer it, and only then go on.
+- Don't rely on a fixed `sleep` after an action that loads data. A record that took 10 seconds to load
+  swallowed the keys typed after 3 seconds, and they ended up in another field. Capture again until the
+  screen shows the loaded data.
+- A grid can keep showing an edited value after it was saved or reverted. Check the result in the data
+  the program writes (a database, a file) rather than on the screen, and reload the record before
+  editing it again.
+
 ## Text widths that differ from Windows
 
 A program that measures text and compares the width with a stored value, for example to check that
