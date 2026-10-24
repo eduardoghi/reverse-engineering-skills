@@ -16,6 +16,7 @@ references, which drops numbers that happen to have the same value.
 """
 import argparse
 import bisect
+import codecs
 import math
 import re
 import struct
@@ -33,6 +34,18 @@ MAX_LITERAL = 1 << 16
 RT_RCDATA = 10
 DFM_SIGNATURE = b"TPF0"
 MAX_CANDIDATES = 10
+# Code page of AnsiString literals and form strings, the Windows ANSI code
+# page of Western European and Brazilian installs. Unlike latin-1 it maps
+# 0x80-0x9F to printable characters such as curly quotes and dashes.
+ANSI = "cp1252"
+
+# The five bytes cp1252 leaves undefined decode as in latin-1, to C1 control
+# characters, so a literal that has one is still rejected as not printable.
+codecs.register_error("bpl-xref-latin1", lambda e: (e.object[e.start:e.end].decode("latin-1"), e.end))
+
+
+def ansi(raw):
+    return raw.decode(ANSI, "bpl-xref-latin1")
 
 
 def safe(text):
@@ -206,7 +219,7 @@ class Image:
             text = data[off:off + 2 * n].decode("utf-16-le", "replace")
             size = 2 * n
         elif data[off + n:off + n + 1] == b"\0":
-            text = data[off:off + n].decode("latin-1")
+            text = ansi(data[off:off + n])
             size = n
         else:
             return None
@@ -297,11 +310,11 @@ def literal_kind(data, off, nbytes, enc):
     Only a hint: any data that happens to have a matching length byte or
     header in front of the text gets the same label.
     """
-    if enc == "latin-1" and off >= 1 and data[off - 1] == nbytes and nbytes < 256:
+    if enc == ANSI and off >= 1 and data[off - 1] == nbytes and nbytes < 256:
         return "ShortString"
     if off >= 8 and data[off - 8:off - 4] == b"\xff\xff\xff\xff":
         length = struct.unpack_from("<I", data, off - 4)[0]
-        if enc == "latin-1" and length == nbytes:
+        if enc == ANSI and length == nbytes:
             return "AnsiString literal"
         if enc == "utf-16-le" and length == nbytes // 2:
             return "UnicodeString literal"
@@ -319,12 +332,12 @@ def cmd_str(img, args):
     data = img.data
     any_match = False
     for needle in args.strings:
-        for enc in ("latin-1", "utf-16-le"):
+        for enc in (ANSI, "utf-16-le"):
             try:
                 pat = needle.encode(enc)
             except UnicodeEncodeError:
                 continue
-            step = 1 if enc == "latin-1" else 2
+            step = 1 if enc == ANSI else 2
             off = data.find(pat)
             while off != -1:
                 kind = literal_kind(data, off, len(pat), enc)
@@ -483,7 +496,7 @@ class DfmReader:
         return struct.unpack(fmt, self.take(struct.calcsize(fmt)))[0]
 
     def short_string(self):
-        return self.take(self.unpack("<B")).decode("latin-1")
+        return ansi(self.take(self.unpack("<B")))
 
     def read_object(self, depth=0):
         if depth > self.MAX_DEPTH:
@@ -532,7 +545,7 @@ class DfmReader:
             self.pos += 1
             return "set", names
         if t == 12:
-            return "str", self.take(self.unpack("<i")).decode("latin-1")
+            return "str", ansi(self.take(self.unpack("<i")))
         if t == 13:
             return "ident", "nil"
         if t == 14:
