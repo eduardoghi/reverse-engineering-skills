@@ -272,6 +272,11 @@ skill. On a BPL it matches most functions by their export names. Filter the JSON
 (`@$xp$...`) and VMTs (`@Unit@TClass@`) come out as functions that fail to decompile or decompile
 to nonsense, and many of them land in `modified`. Skip names that start with `@$xp$`.
 
+ghidriff misses most changes in texts and forms of a Delphi binary: literals with accented
+characters, messages used only in except blocks, resourcestrings and every form property. Compare
+those with `bpl-xref strings` and `bpl-xref dfm --all --no-geometry`, as the `binary-diff` skill
+shows.
+
 For a first pass over one unit, before running ghidriff, compare its exported functions instruction by
 instruction. Take each export of the unit and the next export as the range, so the nested procedures
 that sit before the next export are included. Disassemble both builds with `objdump`, mask what moves

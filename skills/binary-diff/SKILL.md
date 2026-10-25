@@ -96,7 +96,40 @@ jq -r '.functions.added[].name, .functions.deleted[].name' diff/out/json/*.ghidr
 - A function can appear more than once in `modified` when two correlators matched it.
 - Functions in `added` and `deleted` had no match. A renamed or split function shows up as one deleted
   and one or more added, so search the new build for its strings before concluding it was removed.
-- `strings` in the JSON lists added and removed string literals, a quick way to spot new features and
-  new error messages.
+- `strings` in the JSON lists added and removed string labels. It catches a changed text only in some
+  cases, see below.
+
+## What the report leaves out
+
+The `strings` section doesn't compare the contents of the files. It lists the string labels Ghidra
+created (`s_...`) that at least one reference points at, so a changed text shows up only when Ghidra
+defined it as a string and disassembled code uses it. In a Delphi package with five changes of one
+character each, all of the same length, the report caught one:
+
+| Change | In the report |
+| --- | --- |
+| ASCII literal used by ordinary code | yes, as a deleted and an added string |
+| Literal with accented characters used by ordinary code | no, Ghidra left it as `DAT_` |
+| Literal used only in an except block | no, the handler isn't disassembled |
+| resourcestring (string table entry) | no, it is defined in `.rsrc` with no label or reference |
+| Form property (DFM) | no, forms are binary resources |
+
+No function was marked as changed either, because the code still pointed at the same addresses. This
+was checked with the fork above and Ghidra 12.1.4. For Delphi binaries, compare the texts and the
+forms on their own:
+
+```sh
+bpl-xref strings app_1.0.bpl > old.txt
+bpl-xref strings app_1.1.bpl > new.txt
+diff old.txt new.txt
+bpl-xref dfm --all --no-geometry app_1.0.bpl > old.dfm
+bpl-xref dfm --all --no-geometry app_1.1.bpl > new.dfm
+diff old.dfm new.dfm
+```
+
+`strings` lists every literal the code points at and every string table entry, sorted by text and
+without addresses or string IDs, which move between builds, so the diff shows only texts that were
+added or removed. `--no-geometry` drops `Left`, `Top`, `Width`, `Height` and similar properties,
+which change whenever a form is opened in the designer.
 
 Delphi packages have their own notes in the `delphi-bpl` skill.
