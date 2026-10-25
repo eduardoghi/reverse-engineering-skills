@@ -47,7 +47,8 @@ plugin, and Ghidra 12.1.3 or newer with the ReVa extension for long sessions.
    run `bpl-xref calls` on the `ptr` address to reach it.
 
    An EXE usually has no exports, so there are no "prev"/"next" lines. Start from the entry point
-   (`rz-bin -e app.exe`) and from the import thunks, which `flags` names.
+   (`rz-bin -e app.exe`), from the import thunks, which `flags` names, and from the event handlers
+   that `dfm --events` finds through the VMTs (step 3).
 
 3. **Go from a screen to the code** when you know what the user clicks but not which method runs.
    Delphi stores each form as a binary DFM in an RCDATA resource named after the form class, and the
@@ -62,9 +63,25 @@ plugin, and Ghidra 12.1.3 or newer with the ReVa extension for long sessions.
    Find the form by a caption or label in the text output, then take the component's `OnClick`,
    `OnChange` or other event. `--events` prints each handler with the exported method it names
    (`@Unit@TForm@BtnSaveClick$qqrp14System@TObject`), so the address is ready for steps 4 to 6.
-   Events inside collection items show up as `Edit1.Buttons[0].OnClick`. A handler marked `?` was
-   not found in the form's class, usually because an ancestor form declares it, and every method
-   with that name is listed as a candidate.
+   Events inside collection items show up as `Edit1.Buttons[0].OnClick`. Without an export, as in
+   an EXE or for a handler an ancestor form declares, it looks the name up in the published method
+   tables of the form's class and its ancestors and prints `0x... TFOrderEdit.BtnSaveClick
+   (published)`. When the ancestry continues in another package it names the imported ancestor
+   instead, and the method is in that package's exports. A handler marked `?` was found neither way,
+   and every exported method with that name is listed as a candidate. A form whose class has no VMT
+   in the file is usually one the linker kept after dropping its class, so no code runs it.
+
+   `bpl-xref vmt` reads the same VMTs (Delphi 2 to 2007 layout) without exports. Without a class it
+   lists every class with its parent. With one it prints the published methods and the published
+   fields with their offsets, so `mov eax, [ebx+0x3a0]` in a form method is `edtCustomer: TEdit`:
+
+   ```sh
+   bpl-xref vmt app.exe | grep -i order          # classes, parents, size of the published tables
+   bpl-xref vmt app.exe TFOrderEdit              # methods, then +offset name: type for each field
+   ```
+
+   Only components with a field declared in the class show up. Pages of a `TNotebook` and
+   components of an ancestor form from another package don't.
 
 4. **Find who calls a function**, especially a nested procedure, which has no export and no name:
 

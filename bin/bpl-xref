@@ -5,6 +5,7 @@
   bpl-xref calls FILE ADDR|EXPORT...  calls, jumps and pointers to an address
   bpl-xref flags FILE [START END]     rizin flags for import thunks and literals
   bpl-xref dfm FILE [FORM...]         list form resources or print them as text
+  bpl-xref vmt FILE [CLASS...]        list classes or print published methods and fields
 
 Each reference in code shows the nearest function prologue before it
 (push ebp; mov ebp, esp) and the exported functions around it. Nested
@@ -34,6 +35,13 @@ MAX_LITERAL = 1 << 16
 RT_RCDATA = 10
 DFM_SIGNATURE = b"TPF0"
 MAX_CANDIDATES = 10
+# VMT slots of Delphi 2 to 2007, as offsets from the class pointer. Delphi
+# 2009 added three virtual methods in front of them and moved every slot.
+VMT_SELF_PTR = -0x4C
+VMT_FIELD_TABLE = -0x38
+VMT_METHOD_TABLE = -0x34
+VMT_CLASS_NAME = -0x2C
+VMT_PARENT = -0x24
 # Code page of AnsiString literals and form strings, the Windows ANSI code
 # page of Western European and Brazilian installs. Unlike latin-1 it maps
 # 0x80-0x9F to printable characters such as curly quotes and dashes.
@@ -79,6 +87,8 @@ class Image:
         self.relocs = self._highlow_relocs()
         self.funcs = self._exported_functions()
         self.func_addrs = [a for a, _ in self.funcs]
+        self._classes = None
+        self._iat = None
 
     def in_code(self, va):
         rva = va - self.base
@@ -293,6 +303,138 @@ class Image:
                         forms.append((name, body))
         return forms
 
+    def iat(self):
+        if self._iat is None:
+            self._iat = self.import_slots()
+        return self._iat
+
+    def ident_at(self, va):
+        """Return the ShortString at va when it holds a printable ASCII name."""
+        off = self.to_off(va) if va else None
+        if off is None or not 0 <= off < len(self.data):
+            return None
+        raw = self.data[off + 1:off + 1 + self.data[off]]
+        if not raw or len(raw) != self.data[off] or not all(0x21 <= b <= 0x7E for b in raw):
+            return None
+        return raw.decode("ascii")
+
+    def classes(self):
+        """Map each VMT address to its class name.
+
+        A VMT starts with vmtSelfPtr, which holds the VMT address itself, so
+        a dword equal to its own address plus 0x4C marks a candidate. With a
+        relocation table only relocated dwords are checked.
+        """
+        if self._classes is not None:
+            return self._classes
+        if self.relocs is not None:
+            slots = ((self.base + rva, self.read_u32(self.base + rva)) for rva in self.relocs)
+        else:
+            slots = self._aligned_dwords()
+        self._classes = {}
+        for va, value in slots:
+            if value == va - VMT_SELF_PTR:
+                name = self.ident_at(self.read_u32(value + VMT_CLASS_NAME))
+                if name:
+                    self._classes[value] = name
+        return self._classes
+
+    def _aligned_dwords(self):
+        for s in self.pe.sections:
+            raw = self.data[s.PointerToRawData:s.PointerToRawData + s.SizeOfRawData]
+            va0 = self.base + s.VirtualAddress
+            for i, (value,) in enumerate(struct.iter_unpack("<I", raw[:len(raw) & ~3])):
+                yield va0 + 4 * i, value
+
+    def parent(self, vmt):
+        """Return (parent VMT, None), (None, (dll, import name)) or (None, None).
+
+        vmtParent points at a cell that holds the parent's class pointer. For a
+        class from another package the cell is an import slot.
+        """
+        cell = self.read_u32(vmt + VMT_PARENT)
+        if not cell:
+            return None, None
+        if cell in self.iat():
+            return None, self.iat()[cell]
+        value = self.read_u32(cell)
+        return (value, None) if value in self.classes() else (None, None)
+
+    def ancestry(self, vmt):
+        """Return the VMTs from vmt up to its root in this file and the import that continues it."""
+        chain = []
+        while vmt is not None and vmt not in chain:
+            chain.append(vmt)
+            vmt, imported = self.parent(vmt)
+        return chain, imported
+
+    def _table(self, va):
+        off = self.to_off(va) if va else None
+        if off is None or not 0 <= off <= len(self.data) - 2:
+            return None
+        return off
+
+    def published_methods(self, vmt):
+        """Return (name, va) for each entry of the class's published method table.
+
+        Each entry is a 16-bit entry size, the code address and a ShortString
+        name. The size steps over any data after the name.
+        """
+        off = self._table(self.read_u32(vmt + VMT_METHOD_TABLE))
+        if off is None:
+            return []
+        data, methods = self.data, []
+        (count,), p = struct.unpack_from("<H", data, off), off + 2
+        for _ in range(count):
+            if p + 7 > len(data):
+                break
+            size, code = struct.unpack_from("<HI", data, p)
+            name = data[p + 7:p + 7 + data[p + 6]].decode("latin-1")
+            methods.append((name, code))
+            if size < 7:
+                break
+            p += size
+        return methods
+
+    def published_fields(self, vmt):
+        """Return (offset, name, class name) for each published field of the class.
+
+        The table is a field count, a pointer to the field class table and
+        entries of a 32-bit offset, a 16-bit index into the class table and a
+        ShortString name. The class table holds cells, like vmtParent.
+        """
+        off = self._table(self.read_u32(vmt + VMT_FIELD_TABLE))
+        if off is None or off + 6 > len(self.data):
+            return []
+        data = self.data
+        count, class_tab = struct.unpack_from("<HI", data, off)
+        types = []
+        tab = self._table(class_tab)
+        if tab is not None:
+            n = struct.unpack_from("<H", data, tab)[0]
+            for (cell,) in struct.iter_unpack("<I", data[tab + 2:tab + 2 + 4 * n]):
+                types.append(self.class_name_in(cell))
+        fields, p = [], off + 6
+        for _ in range(count):
+            if p + 7 > len(data):
+                break
+            offset, index = struct.unpack_from("<IH", data, p)
+            n = data[p + 6]
+            name = data[p + 7:p + 7 + n].decode("latin-1")
+            fields.append((offset, name, types[index] if index < len(types) else "?"))
+            p += 7 + n
+        return fields
+
+    def class_name_in(self, cell):
+        """Name of the class whose pointer the cell holds, or of the import slot."""
+        if cell in self.iat():
+            return imported_class(self.iat()[cell][1])
+        return self.classes().get(self.read_u32(cell), "?")
+
+    def class_vmts(self, name):
+        """VMTs of the classes with that name. Units can reuse a class name."""
+        return [va for va, n in self.classes().items() if n.lower() == name.lower()]
+
     def import_thunks(self):
         """Yield (va, dll, name) for each `jmp dword [iat]` thunk in code."""
         iat = self.import_slots()
@@ -302,6 +444,12 @@ class Image:
                 slot = struct.unpack("<I", m.group(1))[0]
                 if slot in iat:
                     yield (va0 + m.start() - start, *iat[slot])
+
+
+def imported_class(name):
+    """`TForm` for an imported VMT such as `@Forms@TForm@`, the name itself otherwise."""
+    m = re.fullmatch(r"@(?:[^@]+@)+?([^@]+)@", name)
+    return m.group(1) if m else name
 
 
 def literal_kind(data, off, nbytes, enc):
@@ -740,6 +888,10 @@ def cmd_dfm(img, args):
                 for va, name in exact:
                     print(f"    0x{va:08x} {safe(name)}")
                 continue
+            lines = published_handler(img, owner, handler)
+            if lines:
+                print("\n".join(lines))
+                continue
             # A handler missing from the owner class is usually inherited from
             # an ancestor form. Any method with that name is a candidate, and
             # common names such as FormShow can have hundreds.
@@ -749,7 +901,68 @@ def cmd_dfm(img, args):
             if len(cands) > MAX_CANDIDATES:
                 print(f"    ? {len(cands) - MAX_CANDIDATES} more, find the ancestor form's class to pick one")
             if not cands:
-                print("    no exported method with that name")
+                if not img.classes():
+                    print("    no exported method with that name")
+                elif img.class_vmts(owner):
+                    print("    no exported or published method with that name")
+                else:
+                    print(f"    no method with that name and no VMT for {safe(owner)} in this file (the linker "
+                          "kept the form without its class, or the class is in a package)")
+
+
+def published_handler(img, owner, handler):
+    """Lines for a handler found in the published method table of owner or an ancestor.
+
+    Returns an empty list when no VMT in this file has the method and the
+    ancestry doesn't continue in another package.
+    """
+    lines = []
+    for vmt in img.class_vmts(owner):
+        chain, imported = img.ancestry(vmt)
+        for cls in chain:
+            hit = [(name, va) for name, va in img.published_methods(cls) if name.lower() == handler.lower()]
+            if hit:
+                name, va = hit[0]
+                lines.append(f"    0x{va:08x} {safe(img.classes()[cls])}.{safe(name)} (published)")
+                break
+        else:
+            if imported:
+                dll, name = imported
+                lines.append(f"    not in this file, {safe(img.classes()[chain[-1]])} inherits from "
+                             f"{safe(name)} in {safe(dll)}, look for the method in its exports")
+    return lines
+
+
+def cmd_vmt(img, args):
+    classes = img.classes()
+    if not classes:
+        sys.exit("bpl-xref: no VMTs found (only the Delphi 2 to 2007 layout is read)")
+    if not args.classes:
+        for vmt, name in sorted(classes.items()):
+            parent, imported = img.parent(vmt)
+            base = classes[parent] if parent else imported_class(imported[1]) if imported else "-"
+            print(f"0x{vmt:08x} {safe(name)} < {safe(base)}  {len(img.published_methods(vmt))} methods  "
+                  f"{len(img.published_fields(vmt))} fields")
+        return
+    found = False
+    for wanted in args.classes:
+        for vmt in img.class_vmts(wanted):
+            found = True
+            chain, imported = img.ancestry(vmt)
+            names = [classes[v] for v in chain] + ([f"{imported[1]} in {imported[0]}"] if imported else [])
+            print(f"0x{vmt:08x} {' < '.join(safe(n) for n in names)}")
+            for cls in chain:
+                methods = sorted(img.published_methods(cls), key=lambda m: m[1])
+                fields = sorted(img.published_fields(cls))
+                if not methods and not fields:
+                    continue
+                print(f"  {safe(classes[cls])}")
+                for name, va in methods:
+                    print(f"    0x{va:08x} {safe(name)}")
+                for offset, name, cls_name in fields:
+                    print(f"    +0x{offset:x} {safe(name)}: {safe(cls_name)}")
+    if not found:
+        sys.exit("bpl-xref: no class with that name (run without CLASS to list them)")
 
 
 def main():
@@ -790,12 +1003,25 @@ def main():
                                    "Without FORM, list every form with its class and number of event "
                                    "handlers. With FORM, print it in the layout of a text .dfm file. "
                                    "With --events, print each event handler and the exported method "
-                                   "it names, for the given forms or for all of them. Binary "
+                                   "it names, for the given forms or for all of them. Without an "
+                                   "export, as in an EXE, the handler is looked up in the published "
+                                   "method tables of the form class and its ancestors. Binary "
                                    "properties such as images are shown only by size.")
     p.add_argument("file")
     p.add_argument("forms", nargs="*", metavar="form", help="resource, class or object name (any case)")
     p.add_argument("--events", action="store_true", help="print event handlers and their methods")
     p.set_defaults(func=cmd_dfm)
+
+    p = sub.add_parser("vmt", help="list classes or print their published methods and fields",
+                       description="Find class VMTs (Delphi 2 to 2007 layout) through vmtSelfPtr. "
+                                   "Without CLASS, list every class with its parent and the size of "
+                                   "its published tables. With CLASS, print the class and its "
+                                   "ancestors in this file with each published method address and "
+                                   "each published field offset and type, the components of a form. "
+                                   "Exported names don't matter, so it works on EXEs.")
+    p.add_argument("file")
+    p.add_argument("classes", nargs="*", metavar="class", help="class name (any case)")
+    p.set_defaults(func=cmd_vmt)
 
     args = ap.parse_args()
     if args.cmd == "flags":
