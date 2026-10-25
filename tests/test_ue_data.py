@@ -1,6 +1,6 @@
 """Tests for bin/ue-locres and bin/ue-save against files built here.
 
-The layouts follow what CUE4Parse reads: locres versions 0 to 2, and GVAS
+The layouts follow what CUE4Parse reads, locres versions 0 to 2 and GVAS
 saves with and without the custom version block, the property GUID byte and
 the inner tag of struct arrays. Run with `python3 -m unittest discover -s tests`.
 """
@@ -156,6 +156,15 @@ class LocresTest(Files):
         self.assertEqual(code, 1)
         self.assertIn("not a readable locres", err)
 
+    def test_string_table_offset_outside_the_file(self):
+        good = locres(2)
+        for offset in (-2, -40, len(good)):
+            with self.subTest(offset=offset):
+                bad = good[:17] + struct.pack("<q", offset) + good[25:]
+                code, _, err = run("ue-locres", self.write("off.locres", bad))
+                self.assertEqual(code, 1)
+                self.assertIn(f"string table offset {offset} is outside the file", err)
+
 
 class SaveTest(Files):
     OLD = Gvas(package=500, custom_versions=False, inner_array_tag=False)
@@ -214,6 +223,16 @@ class SaveTest(Files):
         out = self.ok("ue-save", "props", self.write("esc.sav", data))
         self.assertNotIn("\x1b", out)
         self.assertIn("Int\\x1b[2JProperty", out)
+
+    def test_date_out_of_range(self):
+        for ticks in (-1, 1 << 62):
+            with self.subTest(ticks=ticks):
+                data = self.OLD.build().replace(struct.pack("<q", TICKS), struct.pack("<q", ticks), 1)
+                out = self.ok("ue-save", "props", self.write("date.sav", data))
+                self.assertIn(f"SavedAt\tStructProperty DateTime\t8 bytes\t{ticks} ticks, not a valid date", out)
+
+    def test_truncated_header(self):
+        self.assertIn("runs past byte 12", self.malformed("short.sav", self.OLD.build()[:12]))
 
     def test_negative_size_stops(self):
         data = self.OLD.build()

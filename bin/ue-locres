@@ -30,7 +30,7 @@ class Reader:
         self.pos = pos
 
     def take(self, n):
-        if n < 0 or self.pos + n > len(self.data):
+        if n < 0 or self.pos < 0 or self.pos + n > len(self.data):
             raise Truncated(f"read of {n} bytes at {self.pos} runs past the end")
         chunk = self.data[self.pos:self.pos + n]
         self.pos += n
@@ -47,7 +47,7 @@ class Reader:
         return n
 
     def fstring(self):
-        """An FString: a signed length that counts the terminator, negative for UTF-16."""
+        """An FString, whose signed length counts the terminator and is negative for UTF-16."""
         n = self.unpack("<i")
         if n == 0:
             return ""
@@ -69,6 +69,8 @@ def read_locres(data):
     if version >= 1:
         offset = r.unpack("<q")
         if offset != -1:
+            if not 0 <= offset < len(data):
+                raise Truncated(f"string table offset {offset} is outside the file")
             t = Reader(data, offset)
             for _ in range(t.count()):
                 text = t.fstring()

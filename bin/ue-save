@@ -141,7 +141,7 @@ def read_header(r):
         raise Malformed("no GVAS magic")
     h = {"save_version": r.unpack("<i"), "package_ue4": r.unpack("<i"), "package_ue5": None}
     # A UE5 save has a second package version before the engine version.
-    major = struct.unpack_from("<H", r.data, r.pos)[0]
+    major = Reader(r.data, r.pos, r.end).unpack("<H")
     if major not in (4, 5):
         h["package_ue5"] = r.unpack("<i")
     h["engine"] = f"{r.unpack('<H')}.{r.unpack('<H')}.{r.unpack('<H')}-{r.unpack('<I')}"
@@ -228,7 +228,11 @@ def describe(r, h, name, kind, size, extra, depth, indent, out):
             struct_name = extra["struct"]
             if struct_name == "DateTime":
                 ticks = v.unpack("<q")
-                value = (datetime.datetime(1, 1, 1) + datetime.timedelta(microseconds=ticks // 10)).isoformat()
+                try:
+                    value = (datetime.datetime(1, 1, 1) + datetime.timedelta(microseconds=ticks // 10)).isoformat()
+                except OverflowError:
+                    # Unreal's DateTime covers the same years 1 to 9999 as Python's.
+                    value = f"{ticks} ticks, not a valid date"
             elif struct_name in ("Vector", "Rotator") and size == 12:
                 value = str(struct.unpack("<3f", v.take(12)))
             elif struct_name in ("Vector", "Rotator") and size == 24:
