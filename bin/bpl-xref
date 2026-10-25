@@ -18,6 +18,7 @@ references, which drops numbers that happen to have the same value.
 import argparse
 import bisect
 import codecs
+import collections
 import math
 import re
 import struct
@@ -32,6 +33,7 @@ PROLOGUE = b"\x55\x8b\xec"
 IMAGE_SCN_MEM_EXECUTE = 0x20000000
 IMAGE_REL_BASED_HIGHLOW = 3
 MAX_LITERAL = 1 << 16
+RT_STRING = 6
 RT_RCDATA = 10
 DFM_SIGNATURE = b"TPF0"
 MAX_CANDIDATES = 10
@@ -89,6 +91,10 @@ class Image:
         self.func_addrs = [a for a, _ in self.funcs]
         self._classes = None
         self._iat = None
+        self._strings = None
+        self._records = None
+        self._export_names = None
+        self.string_ranges = []
 
     def in_code(self, va):
         rva = va - self.base
@@ -282,26 +288,98 @@ class Image:
             desc += 20
         return slots
 
-    def form_resources(self):
-        """Return (resource name, bytes) for each RCDATA resource holding a binary form."""
+    def resources(self, type_id):
+        """Yield (entry, file offset, bytes) for each resource of a type, in every language."""
         self.pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_RESOURCE"]])
-        forms = []
         root = getattr(self.pe, "DIRECTORY_ENTRY_RESOURCE", None)
         for rtype in root.entries if root else []:
-            if rtype.id != RT_RCDATA or not hasattr(rtype, "directory"):
+            if rtype.id != type_id or not hasattr(rtype, "directory"):
                 continue
             for entry in rtype.directory.entries:
                 if not hasattr(entry, "directory"):
                     continue
-                name = str(entry.name) if entry.name else str(entry.id)
                 for lang in entry.directory.entries:
                     if not hasattr(lang, "data"):
                         continue
                     d = lang.data.struct
-                    body = self.pe.get_data(d.OffsetToData, d.Size)
-                    if body.startswith(DFM_SIGNATURE):
-                        forms.append((name, body))
+                    off = self.to_off(self.base + d.OffsetToData)
+                    yield entry, off, self.pe.get_data(d.OffsetToData, d.Size)
+
+    def form_resources(self):
+        """Return (resource name, bytes) for each RCDATA resource holding a binary form."""
+        forms = []
+        for entry, _off, body in self.resources(RT_RCDATA):
+            if body.startswith(DFM_SIGNATURE):
+                forms.append((str(entry.name) if entry.name else str(entry.id), body))
         return forms
+
+    def resource_strings(self):
+        """Map each string table ID to its text.
+
+        A string table resource holds 16 strings, a 16-bit length in UTF-16
+        units and the text without a terminator, and its ID times 16 minus 16
+        is the ID of the first one. The file ranges of the tables are kept so
+        `str` can skip raw matches inside them.
+        """
+        if self._strings is not None:
+            return self._strings
+        self._strings, self.string_ranges = {}, []
+        for entry, off, body in self.resources(RT_STRING):
+            if entry.id is None:
+                continue
+            if off is not None:
+                self.string_ranges.append((off, off + len(body)))
+            p = 0
+            for i in range(16):
+                if p + 2 > len(body):
+                    break
+                n = struct.unpack_from("<H", body, p)[0]
+                if n:
+                    self._strings[(entry.id - 1) * 16 + i] = body[p + 2:p + 2 + 2 * n].decode("utf-16-le", "replace")
+                p += 2 + 2 * n
+        return self._strings
+
+    def resstring_records(self):
+        """Map string IDs to the resourcestring records (TResStringRec) that load them.
+
+        A record is a pointer to the module handle variable and the string ID.
+        Every record of a file points at the same variable, so pairs with
+        another pointer are numbers that happen to match an ID.
+        """
+        if self._records is not None:
+            return self._records
+        strings = self.resource_strings()
+        if self.relocs is not None:
+            pairs = ((self.base + rva, self.read_u32(self.base + rva), self.read_u32(self.base + rva + 4))
+                     for rva in self.relocs)
+        else:
+            pairs = self._aligned_pairs()
+        candidates = [(va, module, ident) for va, module, ident in pairs if ident in strings and module]
+        modules = collections.Counter(module for _va, module, _ident in candidates)
+        self._records = {}
+        if modules:
+            handle = modules.most_common(1)[0][0]
+            for va, module, ident in candidates:
+                if module == handle:
+                    self._records.setdefault(ident, []).append(va)
+        return self._records
+
+    def _aligned_pairs(self):
+        prev = None
+        for va, value in self._aligned_dwords():
+            if prev is not None and prev[0] + 4 == va:
+                yield prev[0], prev[1], value
+            prev = (va, value)
+
+    def export_name(self, va):
+        """Name of the export at va, functions and data alike."""
+        if self._export_names is None:
+            self._export_names = {}
+            if hasattr(self.pe, "DIRECTORY_ENTRY_EXPORT"):
+                for sym in self.pe.DIRECTORY_ENTRY_EXPORT.symbols:
+                    if sym.name:
+                        self._export_names.setdefault(self.base + sym.address, sym.name.decode("latin-1"))
+        return self._export_names.get(va)
 
     def iat(self):
         if self._iat is None:
@@ -476,9 +554,41 @@ def print_refs(img, refs):
             print(f"        {line}")
 
 
+def print_resstrings(img, needle):
+    """Print each resourcestring whose text contains needle and the code that loads it.
+
+    Code passes the record to LoadResString (`mov eax, offset rec`), so the
+    references go to the record, not to the text.
+    """
+    matches = [(ident, text) for ident, text in sorted(img.resource_strings().items()) if needle in text]
+    if not matches:
+        return False
+    records = img.resstring_records()
+    wanted = {rec for ident, _ in matches for rec in records.get(ident, [])}
+    refs = collections.defaultdict(list)
+    for va, target in img.pointers_to(wanted):
+        refs[target].append(("ref" if img.in_code(va) else "ptr", va))
+    for ident, text in matches:
+        where = "" if text == needle else f" in {text!r}"
+        print(f"{needle!r} (resourcestring {ident}){where}")
+        if ident not in records:
+            print("    no resourcestring record, the string table may not come from Delphi code")
+        for rec in records.get(ident, []):
+            name = img.export_name(rec)
+            print(f"    record 0x{rec:08x}" + (f" {safe(name)}" if name else ""))
+            if refs[rec]:
+                print_refs(img, refs[rec])
+            elif name:
+                print("    no references here, other packages load it through the export")
+            else:
+                print("    no references")
+    return True
+
+
 def cmd_str(img, args):
     data = img.data
     any_match = False
+    img.resource_strings()
     for needle in args.strings:
         for enc in (ANSI, "utf-16-le"):
             try:
@@ -491,7 +601,10 @@ def cmd_str(img, args):
                 kind = literal_kind(data, off, len(pat), enc)
                 terminated = data[off + len(pat):off + len(pat) + step].strip(b"\0") == b""
                 va = img.to_va(off)
-                if va is not None and (kind or terminated):
+                # Text inside a string table is reported below through its
+                # resourcestring record, the only thing code points at.
+                in_table = any(lo <= off < hi for lo, hi in img.string_ranges)
+                if va is not None and (kind or terminated) and not in_table:
                     any_match = True
                     label = f", {kind}" if kind else ""
                     print(f"{needle!r} ({enc}{label}) at 0x{va:08x}")
@@ -513,6 +626,8 @@ def cmd_str(img, args):
                     else:
                         print("    no direct references")
                 off = data.find(pat, off + 1)
+        if print_resstrings(img, needle):
+            any_match = True
     if not any_match:
         sys.exit("bpl-xref: no match")
 
@@ -973,7 +1088,9 @@ def main():
 
     p = sub.add_parser("str", help="find the code that references a string",
                        description="For each ANSI or UTF-16LE match of a string, print the literal kind "
-                                   "and every reference to it from code.")
+                                   "and every reference to it from code. Strings in the string table "
+                                   "(resourcestring) match when they contain the text, and the "
+                                   "references are those to the record that LoadResString reads.")
     p.add_argument("file")
     p.add_argument("strings", nargs="+", metavar="string", help="exact text to look for (case-sensitive)")
     p.set_defaults(func=cmd_str)

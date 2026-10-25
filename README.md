@@ -20,10 +20,10 @@ Skills and helper scripts for Claude Code reverse-engineering work. New skills g
 - `bin/java-decompile`: wrapper around Vineflower used by the `java-decompile` skill. Run it with `--help`
   for the options.
 - `bin/bpl-xref`: cross-references for 32-bit PE files, used by the `delphi-bpl` skill. Finds the code
-  that uses a string literal (`str`), the calls and pointers to an address (`calls`), prints rizin
-  flags that name import thunks and string literals in the disassembly (`flags`), reads the form
-  resources to map each event to its method (`dfm`) and lists the published methods and fields of
-  each class from its VMT, which also works on EXEs without exports (`vmt`).
+  that uses a string literal or a resourcestring (`str`), the calls and pointers to an address
+  (`calls`), prints rizin flags that name import thunks and string literals in the disassembly
+  (`flags`), reads the form resources to map each event to its method (`dfm`) and lists the published
+  methods and fields of each class from its VMT, which also works on EXEs without exports (`vmt`).
 
 ## Setup
 

@@ -46,6 +46,14 @@ plugin, and Ghidra 12.1.3 or newer with the ReVa extension for long sessions.
    names, resource strings, initialized records). The code reads the table slot, not the string, so
    run `bpl-xref calls` on the `ptr` address to reach it.
 
+   Messages declared as `resourcestring` live in the string table resource as UTF-16 without a
+   terminator, and code never points at the text. It loads a record of a module handle pointer and
+   the string ID (`mov eax, offset rec; call LoadResString`). `str` also searches the string table,
+   matching any string that contains the text, and prints `(resourcestring ID)`, the record with
+   its exported name when there is one (`@Uorders@SInvalidOrder`) and the code that
+   references the record. A record without references in a package is usually loaded by other
+   packages through that export.
+
    An EXE usually has no exports, so there are no "prev"/"next" lines. Start from the entry point
    (`rz-bin -e app.exe`), from the import thunks, which `flags` names, and from the event handlers
    that `dfm --events` finds through the VMTs (step 3).
