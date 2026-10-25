@@ -10,8 +10,9 @@ when the player walks into a volume) is written in blueprints. A packaged game k
 bytecode inside `.uasset` and `.umap` files in the paks. The rest is native C++ in the executable. A
 blueprint can call a native function, but only the function's name is visible in the assets.
 
-[CUE4Parse](https://github.com/FabianFG/CUE4Parse) reads the paks and exports assets as JSON, and
-`kismet-trace` (this repo's `bin/`) reads the bytecode in that JSON.
+[CUE4Parse](https://github.com/FabianFG/CUE4Parse) reads the paks and exports assets as JSON. From
+this repo's `bin/`, `kismet-trace` reads the bytecode in that JSON, `ue-locres` the localized
+strings and `ue-save` the save files.
 
 ## Setup
 
@@ -105,12 +106,17 @@ switch (cmd)
 
 2. **Go from the text to the asset.** The player sees a title or a message, and the assets use keys
    and internal names. The strings live in `Content/Localization/<target>/<culture>/<target>.locres`.
-   Extract it with `ue-export ... raw` and look up the text. In older games the file has no magic and
-   is a namespace count, then for each namespace an FString name and a key count, then for each key
-   an FString key, a 32-bit hash and an FString text. An FString is a signed 32-bit length that
-   counts the terminator, negative for UTF-16. The key can carry the internal code of what it labels
-   (a mission title key holding the mission's code), which leads to its data asset, and a mission
-   data asset names the map that runs it.
+   Extract it with `ue-export ... raw` and search it with `ue-locres`, which prints namespace, key and
+   text per line and reads every format version:
+
+   ```sh
+   ue-locres Content/Localization/Game/en/Game.locres "old door"   # entries whose key or text match
+   ```
+
+   CUE4Parse's own culture lookup can fail on a game's custom localization folders, which is why the
+   file is read directly. The key can carry the internal code of what it labels (a mission title key
+   holding the mission's code), which leads to its data asset, and a mission data asset names the map
+   that runs it.
 
 3. **Export the map or blueprint as JSON** with `ue-export ... json`, using the path as `list`
    prints it. A map export holds the level script (`<map>_C`, with an `ExecuteUbergraph` function),
@@ -164,12 +170,22 @@ the wrong chain.
 
 Saves written through Unreal's SaveGame system are GVAS files. They start with the magic `GVAS`, the
 save and package versions, the engine version and the save class name, followed by tagged properties
-until `None`. Games may
-wrap them in their own header and compress them in Unreal's chunk format (a 64-bit tag
-`0x9E2A83C1`, the block size, compressed and uncompressed totals, then the size of each block)
-with zlib or Oodle. The saves of a game built on UE 4.11 had no custom version block after the
-engine version and no GUID byte after each property tag, so parsers written for newer saves read
-them wrong.
+until `None`. Games may wrap them in their own header and compress them in Unreal's chunk format (a
+64-bit tag `0x9E2A83C1`, the block size, compressed and uncompressed totals, then the size of each
+block) with zlib or Oodle. `ue-save` reads both:
+
+```sh
+ue-save props slot1.sav --oodle oodle-data-shared.dll              # header and top-level properties
+ue-save props slot1.sav --oodle oodle-data-shared.dll --depth 2    # fields of structs and struct arrays
+ue-save unpack slot1.sav slot1.gvas --oodle oodle-data-shared.dll  # the plain GVAS, for a hex editor
+```
+
+Use the Oodle library the exporter downloaded. `ue-save` works out from the bytes which optional
+parts a save has, because the header can't be trusted for it. One game built on UE 4.11 declared
+package version 500 but wrote no custom version block, no GUID byte after each property tag and no
+inner tag before the items of struct arrays. Games can also append their own data after the
+property list, and `props` says how many bytes follow it. Property tags of UE 5.4 and newer use a
+different layout and are refused.
 
 Work on copies. Before putting a save from elsewhere in the game's folder, back up the folder and
 turn off Steam Cloud for the game, or the swapped save can be uploaded over the real one.

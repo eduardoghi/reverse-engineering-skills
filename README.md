@@ -31,6 +31,11 @@ Skills and helper scripts for Claude Code reverse-engineering work. New skills g
 - `bin/kismet-trace`: reads Unreal Engine blueprint bytecode from a CUE4Parse JSON export. Prints the
   functions as pseudocode with the start of each event marked (`list`), lists the events (`events`)
   and follows one event through the jumps of the ubergraph, branch by branch (`follow`).
+- `bin/ue-locres`: prints the strings of an Unreal Engine `.locres` file, any format version, and
+  filters them by key or text.
+- `bin/ue-save`: reads Unreal Engine save files (GVAS), also inside Unreal's compressed chunk format
+  with zlib or Oodle, and lists the header and the properties with their values (`props`) or writes
+  the plain GVAS (`unpack`).
 
 ## Setup
 
@@ -44,6 +49,8 @@ ln -sfn "$PWD/bin/java-decompile" ~/.local/bin/java-decompile
 ln -sfn "$PWD/skills/delphi-bpl" ~/.claude/skills/delphi-bpl
 ln -sfn "$PWD/bin/bpl-xref" ~/.local/bin/bpl-xref
 ln -sfn "$PWD/bin/kismet-trace" ~/.local/bin/kismet-trace
+ln -sfn "$PWD/bin/ue-locres" ~/.local/bin/ue-locres
+ln -sfn "$PWD/bin/ue-save" ~/.local/bin/ue-save
 ln -sfn "$PWD/skills/binary-diff" ~/.claude/skills/binary-diff
 ln -sfn "$PWD/skills/binary-patch" ~/.claude/skills/binary-patch
 ln -sfn "$PWD/skills/wine-debugging" ~/.claude/skills/wine-debugging
@@ -68,7 +75,8 @@ Requirements for `delphi-bpl`:
 Requirements for `unreal-engine`:
 
 - The .NET 10 SDK to build CUE4Parse and the small exporter the skill shows
-- `kismet-trace`, below
+- `kismet-trace`, below, and `ue-locres` and `ue-save`, which need only Python 3. `ue-save` needs the
+  Oodle library the exporter downloads for Oodle-compressed saves
 
 Requirements for `kismet-trace`:
 
@@ -112,6 +120,9 @@ bpl-xref strings app.bpl > app.txt
 kismet-trace events Level.umap.json
 kismet-trace list Level.umap.json --hide DoOnce
 kismet-trace follow Level.umap.json OnDoorOpened
+
+ue-locres Game.locres "old door"
+ue-save props slot1.sav --oodle oodle-data-shared.dll --depth 1
 bpl-xref vmt app.exe TFORDEREDIT
 ```
 
@@ -125,7 +136,8 @@ python3 -m unittest discover -s tests
 ```
 
 The tests build their inputs in code (small PE files for `bpl-xref`, a blueprint export for
-`kismet-trace`), so no real binaries or games are needed. The `bpl-xref` tests need `pefile` and are
+`kismet-trace`, localization files and saves for `ue-locres` and `ue-save`), so no real binaries or
+games are needed. The `bpl-xref` tests need `pefile` and are
 skipped without it.
 
 ## License

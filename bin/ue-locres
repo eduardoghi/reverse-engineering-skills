@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""Print the strings of an Unreal Engine localization file (.locres).
+
+  ue-locres FILE [TEXT...]
+
+Prints namespace, key and text separated by tabs, one entry per line. Tabs,
+line breaks, backslashes and unprintable characters are escaped. With TEXT,
+only entries whose key or text contains one of the given texts (any case).
+
+Reads the legacy format, which has no magic number, and the versions that
+start with a magic number and a version byte: 1 keeps the texts in a table
+at the end of the file, 2 and 3 also store a hash before each namespace and
+key, the number of entries and a reference count for each text.
+"""
+import argparse
+import struct
+import sys
+
+MAGIC = struct.pack("<4I", 0x7574140E, 0xFC034A67, 0x9D90154A, 0x1B7F37C3)
+LATEST = 3
+
+
+class Truncated(Exception):
+    pass
+
+
+class Reader:
+    def __init__(self, data, pos=0):
+        self.data = data
+        self.pos = pos
+
+    def take(self, n):
+        if n < 0 or self.pos + n > len(self.data):
+            raise Truncated(f"read of {n} bytes at {self.pos} runs past the end")
+        chunk = self.data[self.pos:self.pos + n]
+        self.pos += n
+        return chunk
+
+    def unpack(self, fmt):
+        return struct.unpack(fmt, self.take(struct.calcsize(fmt)))[0]
+
+    def count(self, fmt="<I"):
+        """A count that can't be larger than the bytes left, which stops garbage early."""
+        n = self.unpack(fmt)
+        if n > len(self.data) - self.pos:
+            raise Truncated(f"count {n} at {self.pos - 4} is larger than the rest of the file")
+        return n
+
+    def fstring(self):
+        """An FString: a signed length that counts the terminator, negative for UTF-16."""
+        n = self.unpack("<i")
+        if n == 0:
+            return ""
+        if n > 0:
+            return self.take(n)[:-1].decode("latin-1")
+        return self.take(-2 * n)[:-2].decode("utf-16-le", "replace")
+
+
+def read_locres(data):
+    """Return (version, [(namespace, key, text)])."""
+    r = Reader(data)
+    version = 0
+    if data[:16] == MAGIC:
+        r.pos = 16
+        version = r.unpack("<B")
+        if version > LATEST:
+            raise ValueError(f"locres version {version} is newer than this reader ({LATEST})")
+    table = []
+    if version >= 1:
+        offset = r.unpack("<q")
+        if offset != -1:
+            t = Reader(data, offset)
+            for _ in range(t.count()):
+                text = t.fstring()
+                if version >= 2:
+                    t.unpack("<i")  # reference count
+                table.append(text)
+    if version >= 2:
+        r.unpack("<I")  # number of entries
+    entries = []
+    for _ in range(r.count()):
+        if version >= 2:
+            r.unpack("<I")  # namespace hash
+        namespace = r.fstring()
+        for _ in range(r.count()):
+            if version >= 2:
+                r.unpack("<I")  # key hash
+            key = r.fstring()
+            r.unpack("<I")  # hash of the source string
+            if version >= 1:
+                index = r.unpack("<i")
+                text = table[index] if 0 <= index < len(table) else None
+            else:
+                text = r.fstring()
+            entries.append((namespace, key, text))
+    return version, entries
+
+
+def escape(text):
+    special = {"\t": "\\t", "\n": "\\n", "\r": "\\r", "\\": "\\\\"}
+    return "".join(special.get(c, c if c.isprintable() else f"\\x{ord(c):02x}") for c in text)
+
+
+def main():
+    head, tail = __doc__.split("\n\n", 1)
+    ap = argparse.ArgumentParser(prog="ue-locres", description=head, epilog=tail,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("file")
+    ap.add_argument("texts", nargs="*", metavar="text", help="keep entries whose key or text contains it")
+    args = ap.parse_args()
+    try:
+        data = open(args.file, "rb").read()
+        _version, entries = read_locres(data)
+    except OSError as e:
+        sys.exit(f"ue-locres: {e}")
+    except (Truncated, ValueError, UnicodeDecodeError) as e:
+        sys.exit(f"ue-locres: {args.file}: not a readable locres ({e})")
+    wanted = [t.lower() for t in args.texts]
+    for namespace, key, text in entries:
+        if text is None:
+            text = ""
+            print(f"ue-locres: {escape(key)} points past the text table", file=sys.stderr)
+        if wanted and not any(w in key.lower() or w in text.lower() for w in wanted):
+            continue
+        print(f"{escape(namespace)}\t{escape(key)}\t{escape(text)}")
+
+
+if __name__ == "__main__":
+    main()

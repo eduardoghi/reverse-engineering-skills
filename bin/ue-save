@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""Read Unreal Engine save files (GVAS), compressed or not.
+
+  ue-save unpack FILE OUT [--oodle LIB]   write the GVAS data of a compressed save
+  ue-save props FILE [--oodle LIB]        header and properties with their values
+
+A save written by Unreal's SaveGame system starts with GVAS. Games may put
+it inside their own header and compress it in Unreal's chunk format, a
+64-bit tag 0x9E2A83C1 followed by the block size, the compressed and
+uncompressed totals, the size of each block and the blocks. Blocks are
+zlib or Oodle. Oodle needs the library given with --oodle, such as the
+oodle-data-shared.dll that CUE4Parse downloads.
+"""
+import argparse
+import ctypes
+import datetime
+import struct
+import sys
+import zlib
+
+CHUNK_TAG = struct.pack("<Q", 0x9E2A83C1)
+# Package versions that change the property tag, from Unreal's object versions.
+STRUCT_GUID_IN_PROPERTY_TAG = 441
+PROPERTY_GUID_IN_PROPERTY_TAG = 503
+PROPERTY_TAG_SET_MAP_SUPPORT = 509
+UE5_PROPERTY_TAG_EXTENSION = 1011
+NUMBERS = {"IntProperty": "<i", "UInt32Property": "<I", "Int64Property": "<q", "UInt64Property": "<Q",
+           "Int16Property": "<h", "UInt16Property": "<H", "Int8Property": "<b", "FloatProperty": "<f",
+           "DoubleProperty": "<d"}
+
+
+class Malformed(Exception):
+    pass
+
+
+class Reader:
+    def __init__(self, data, pos=0, end=None):
+        self.data = data
+        self.pos = pos
+        self.end = len(data) if end is None else end
+
+    def take(self, n):
+        if n < 0 or self.pos + n > self.end:
+            raise Malformed(f"read of {n} bytes at {self.pos} runs past byte {self.end}")
+        chunk = self.data[self.pos:self.pos + n]
+        self.pos += n
+        return chunk
+
+    def unpack(self, fmt):
+        return struct.unpack(fmt, self.take(struct.calcsize(fmt)))[0]
+
+    def fstring(self):
+        n = self.unpack("<i")
+        if n == 0:
+            return ""
+        if n > 0:
+            raw = self.take(n)
+            if raw[-1:] != b"\0":
+                raise Malformed(f"string at {self.pos - n - 4} has no terminator")
+            return raw[:-1].decode("latin-1")
+        raw = self.take(-2 * n)
+        if raw[-2:] != b"\0\0":
+            raise Malformed(f"string at {self.pos + 2 * n - 4} has no terminator")
+        return raw[:-2].decode("utf-16-le", "replace")
+
+
+def oodle_decompress(lib, chunk, size):
+    lib.OodleLZ_Decompress.restype = ctypes.c_int64
+    lib.OodleLZ_Decompress.argtypes = ([ctypes.c_char_p, ctypes.c_int64, ctypes.c_char_p, ctypes.c_int64]
+                                       + [ctypes.c_int] * 3 + [ctypes.c_void_p] * 6 + [ctypes.c_int])
+    buf = ctypes.create_string_buffer(size)
+    n = lib.OodleLZ_Decompress(chunk, len(chunk), buf, size, 1, 0, 0, None, None, None, None, None, None, 3)
+    if n != size:
+        raise Malformed(f"Oodle returned {n} bytes for a block of {size}")
+    return buf.raw
+
+
+def gvas_bytes(data, oodle_path):
+    """Return the GVAS data of a file, decompressing Unreal compressed chunks first."""
+    if data[:4] == b"GVAS":
+        return data
+    start = data.find(CHUNK_TAG, 0, 4096)
+    if start < 0:
+        raise Malformed("neither GVAS nor a compressed chunk tag in the first 4096 bytes")
+    lib = None
+    out = bytearray()
+    r = Reader(data, start)
+    while r.pos + 32 <= len(data) and data[r.pos:r.pos + 8] == CHUNK_TAG:
+        _tag, _block, _csize, usize = struct.unpack("<QQQQ", r.take(32))
+        blocks, total = [], 0
+        while total < usize:
+            c, u = struct.unpack("<QQ", r.take(16))
+            blocks.append((c, u))
+            total += u
+        for c, u in blocks:
+            chunk = r.take(c)
+            if chunk[:1] == b"\x78":
+                out += zlib.decompress(chunk)
+            else:
+                if oodle_path is None:
+                    raise Malformed("the blocks are compressed with Oodle, pass --oodle with the library")
+                if lib is None:
+                    lib = ctypes.CDLL(oodle_path)
+                out += oodle_decompress(lib, chunk, u)
+    if out[:4] != b"GVAS":
+        raise Malformed("the decompressed data doesn't start with GVAS")
+    return bytes(out)
+
+
+def is_name(r):
+    """Whether an FString holding a plausible class name starts here.
+
+    The custom version block that can come instead starts with the format
+    number 3, read as a 3-byte string whose characters include a zero.
+    """
+    try:
+        text = Reader(r.data, r.pos, r.end).fstring()
+    except Malformed:
+        return False
+    return 0 < len(text) < 512 and all(c.isprintable() for c in text)
+
+
+def read_header(r):
+    """Read the GVAS header. Fields that only some versions have are detected by checking what follows."""
+    if r.take(4) != b"GVAS":
+        raise Malformed("no GVAS magic")
+    h = {"save_version": r.unpack("<i"), "package_ue4": r.unpack("<i"), "package_ue5": None}
+    # A UE5 save has a second package version before the engine version.
+    major = struct.unpack_from("<H", r.data, r.pos)[0]
+    if major not in (4, 5):
+        h["package_ue5"] = r.unpack("<i")
+    h["engine"] = f"{r.unpack('<H')}.{r.unpack('<H')}.{r.unpack('<H')}-{r.unpack('<I')}"
+    h["branch"] = r.fstring()
+    h["custom_versions"] = 0
+    if not is_name(r):
+        fmt = r.unpack("<i")
+        if fmt != 3:
+            raise Malformed(f"custom version format {fmt} isn't read, only format 3")
+        h["custom_versions"] = r.unpack("<i")
+        r.take(20 * h["custom_versions"])
+    h["class"] = r.fstring()
+    return h
+
+
+def read_tag(r, h):
+    """Return (name, type, size, extra) for the next property tag, or None at the end of a list."""
+    name = r.fstring()
+    if name == "None":
+        return None
+    kind = r.fstring()
+    size = r.unpack("<i")
+    r.unpack("<i")  # array index
+    extra = {}
+    if kind == "StructProperty":
+        extra["struct"] = r.fstring()
+        if h["package_ue4"] >= STRUCT_GUID_IN_PROPERTY_TAG:
+            r.take(16)
+    elif kind == "BoolProperty":
+        extra["bool"] = r.unpack("<B") != 0
+    elif kind in ("ByteProperty", "EnumProperty"):
+        extra["enum"] = r.fstring()
+    elif kind == "ArrayProperty":
+        extra["inner"] = r.fstring()
+    elif kind == "SetProperty" and h["package_ue4"] >= PROPERTY_TAG_SET_MAP_SUPPORT:
+        extra["inner"] = r.fstring()
+    elif kind == "MapProperty" and h["package_ue4"] >= PROPERTY_TAG_SET_MAP_SUPPORT:
+        extra["inner"], extra["value"] = r.fstring(), r.fstring()
+    if h["package_ue4"] >= PROPERTY_GUID_IN_PROPERTY_TAG and r.unpack("<B"):
+        r.take(16)
+    return name, kind, size, extra
+
+
+def escape(text):
+    return "".join(c if c.isprintable() else f"\\x{ord(c):02x}" for c in text)
+
+
+def describe(r, h, name, kind, size, extra, depth, indent, out):
+    """Print one property and, for structs and arrays of structs, their fields up to depth."""
+    pad = "  " * indent
+    end = r.pos + size
+    v = Reader(r.data, r.pos, end)
+    label = kind + "".join(f" {extra[k]}" for k in ("struct", "enum", "inner", "value") if k in extra)
+    value, children = "", None
+    try:
+        if kind in NUMBERS:
+            value = str(v.unpack(NUMBERS[kind]))
+        elif kind == "BoolProperty":
+            value = str(extra["bool"]).lower()
+        elif kind in ("StrProperty", "NameProperty", "EnumProperty"):
+            value = repr(v.fstring())
+        elif kind == "ByteProperty":
+            value = repr(v.fstring()) if extra.get("enum", "None") != "None" else str(v.unpack("<B"))
+        elif kind == "ArrayProperty":
+            count = v.unpack("<i")
+            value = f"{count} items"
+            if extra.get("inner") in ("StrProperty", "NameProperty") and count <= 16:
+                value += " " + repr([v.fstring() for _ in range(count)])
+            elif extra.get("inner") == "StructProperty" and depth > 0:
+                # Unreal writes a tag that repeats the array's name before the items from
+                # package version 500 on, but some games' saves leave it out, so look for it.
+                probe = Reader(v.data, v.pos, v.end)
+                try:
+                    has_tag = probe.fstring() == name and probe.fstring() == "StructProperty"
+                except Malformed:
+                    has_tag = False
+                if has_tag:
+                    read_tag(v, h)
+                children = ("items", count, None, v)
+        elif kind == "StructProperty":
+            struct_name = extra["struct"]
+            if struct_name == "DateTime":
+                ticks = v.unpack("<q")
+                value = (datetime.datetime(1, 1, 1) + datetime.timedelta(microseconds=ticks // 10)).isoformat()
+            elif struct_name in ("Vector", "Rotator") and size == 12:
+                value = str(struct.unpack("<3f", v.take(12)))
+            elif struct_name in ("Vector", "Rotator") and size == 24:
+                value = str(struct.unpack("<3d", v.take(24)))
+            elif struct_name == "Guid" and size == 16:
+                value = v.take(16).hex()
+            elif depth > 0:
+                children = ("fields", None, None, v)
+    except Malformed as e:
+        value = f"(unreadable: {e})"
+    out.append(f"{pad}{escape(name)}\t{label}\t{size} bytes\t{escape(value)}".rstrip())
+    if children:
+        mode, count, inner, cr = children
+        try:
+            if mode == "fields":
+                list_props(cr, h, depth - 1, indent + 1, out)
+            else:
+                for i in range(count):
+                    out.append(f"{pad}  [{i}]")
+                    list_props(cr, h, depth - 1, indent + 2, out)
+        except Malformed as e:
+            out.append(f"{pad}  (not a tagged property list: {e})")
+    r.pos = end
+
+
+def list_props(r, h, depth, indent, out):
+    while r.pos < r.end:
+        tag = read_tag(r, h)
+        if tag is None:
+            return
+        describe(r, h, *tag, depth, indent, out)
+
+
+def cmd_unpack(data, args):
+    with open(args.out, "wb") as fh:
+        fh.write(data)
+    print(f"{len(data)} bytes of GVAS written to {args.out}", file=sys.stderr)
+
+
+def cmd_props(data, args):
+    r = Reader(data)
+    h = read_header(r)
+    print(f"save version {h['save_version']}, package version {h['package_ue4']}"
+          + (f"/{h['package_ue5']}" if h["package_ue5"] is not None else "")
+          + f", engine {h['engine']} {escape(h['branch'])}, {h['custom_versions']} custom versions,"
+            f" class {escape(h['class'])}")
+    if h["package_ue5"] is not None and h["package_ue5"] >= UE5_PROPERTY_TAG_EXTENSION:
+        sys.exit("ue-save: property tags of UE 5.4 and newer aren't read")
+    out = []
+    try:
+        list_props(r, h, args.depth, 0, out)
+    finally:
+        print("\n".join(out))
+    # Games can append their own data after the property list, such as saved actors.
+    if r.pos < len(data):
+        print(f"{len(data) - r.pos} bytes after the property list, from offset {r.pos}")
+
+
+def main():
+    head, tail = __doc__.split("\n\n", 1)
+    ap = argparse.ArgumentParser(prog="ue-save", description=head, epilog=tail,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True, metavar="command")
+    p = sub.add_parser("unpack", help="write the GVAS data of a compressed save")
+    p.add_argument("file")
+    p.add_argument("out")
+    p.add_argument("--oodle", metavar="LIB", help="Oodle library for Oodle-compressed blocks")
+    p.set_defaults(func=cmd_unpack)
+    p = sub.add_parser("props", help="print the header and the properties",
+                       description="Print the GVAS header and the top-level properties, one per line "
+                                   "with name, type, size and value. Simple values are decoded, "
+                                   "structs and arrays show their type and size. With --depth N, the "
+                                   "fields of structs and of arrays of structs are listed N levels deep.")
+    p.add_argument("file")
+    p.add_argument("--oodle", metavar="LIB", help="Oodle library for Oodle-compressed blocks")
+    p.add_argument("--depth", type=int, default=0, help="levels of struct fields to list (default 0)")
+    p.set_defaults(func=cmd_props)
+    args = ap.parse_args()
+    try:
+        data = gvas_bytes(open(args.file, "rb").read(), args.oodle)
+        args.func(data, args)
+    except OSError as e:
+        sys.exit(f"ue-save: {e}")
+    except Malformed as e:
+        sys.exit(f"ue-save: {args.file}: {e}")
+
+
+if __name__ == "__main__":
+    main()
