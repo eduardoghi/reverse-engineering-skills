@@ -204,6 +204,44 @@ class SaveTest(Files):
         self.assertEqual(code, 1)
         self.assertIn("pass --oodle", err)
 
+    def malformed(self, name, data):
+        code, out, err = run("ue-save", "props", self.write(name, data))
+        self.assertEqual(code, 1, out)
+        return err
+
+    def test_type_names_are_escaped(self):
+        data = self.OLD.build().replace(fstring("IntProperty"), fstring("Int\x1b[2JProperty"), 1)
+        out = self.ok("ue-save", "props", self.write("esc.sav", data))
+        self.assertNotIn("\x1b", out)
+        self.assertIn("Int\\x1b[2JProperty", out)
+
+    def test_negative_size_stops(self):
+        data = self.OLD.build()
+        i = data.find(fstring("IntProperty")) + len(fstring("IntProperty"))
+        bad = data[:i] + struct.pack("<i", -64) + data[i + 4:]
+        self.assertIn("declares -64 bytes", self.malformed("neg.sav", bad))
+
+    def test_array_count_larger_than_its_bytes(self):
+        data = self.OLD.build()
+        i = data.find(fstring("Records") + fstring("ArrayProperty"))
+        count_at = data.find(struct.pack("<i", 2) + fstring("Key"), i)
+        bad = data[:count_at] + struct.pack("<i", 0x7FFFFFFF) + data[count_at + 4:]
+        out = self.ok("ue-save", "props", self.write("count.sav", bad), "--depth", "1")
+        self.assertIn("declares 2147483647 items but its bytes end after 2", out)
+
+    def test_zlib_block_larger_than_declared(self):
+        data = bytearray(chunked(b"GVAS" + b"\0" * 60))
+        sizes = 4 + 32
+        c, u = struct.unpack_from("<QQ", data, sizes)
+        struct.pack_into("<Q", data, sizes + 8, u - 1)
+        struct.pack_into("<Q", data, 4 + 24, u - 1)
+        self.assertIn("doesn't hold the 63 bytes", self.malformed("bomb.sav", bytes(data)))
+
+    def test_block_size_out_of_range(self):
+        data = bytearray(chunked(self.OLD.build()))
+        struct.pack_into("<Q", data, 4 + 8, 1 << 40)
+        self.assertIn("block size 1099511627776", self.malformed("block.sav", bytes(data)))
+
     def test_newer_property_tags_are_refused(self):
         data = self.NEW.build()
         # Version 3 adds a UE5 package version before the engine version.

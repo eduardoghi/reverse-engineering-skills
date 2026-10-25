@@ -19,6 +19,9 @@ import sys
 import zlib
 
 CHUNK_TAG = struct.pack("<Q", 0x9E2A83C1)
+# The saves this was tried on used blocks of 128 KiB. The cap only rejects nonsense sizes before
+# memory is allocated for them.
+MAX_BLOCK = 64 << 20
 # Package versions that change the property tag, from Unreal's object versions.
 STRUCT_GUID_IN_PROPERTY_TAG = 441
 PROPERTY_GUID_IN_PROPERTY_TAG = 503
@@ -86,16 +89,28 @@ def gvas_bytes(data, oodle_path):
     out = bytearray()
     r = Reader(data, start)
     while r.pos + 32 <= len(data) and data[r.pos:r.pos + 8] == CHUNK_TAG:
-        _tag, _block, _csize, usize = struct.unpack("<QQQQ", r.take(32))
+        _tag, block, _csize, usize = struct.unpack("<QQQQ", r.take(32))
+        if not 0 < block <= MAX_BLOCK:
+            raise Malformed(f"block size {block} at {r.pos - 24} is outside 1 to {MAX_BLOCK}")
         blocks, total = [], 0
         while total < usize:
             c, u = struct.unpack("<QQ", r.take(16))
+            # Every block but the last holds exactly the block size, so a larger one is corrupt.
+            if not 0 < u <= block:
+                raise Malformed(f"block of {u} bytes at {r.pos - 16} is outside 1 to {block}")
             blocks.append((c, u))
             total += u
         for c, u in blocks:
             chunk = r.take(c)
             if chunk[:1] == b"\x78":
-                out += zlib.decompress(chunk)
+                z = zlib.decompressobj()
+                try:
+                    raw = z.decompress(chunk, u)
+                except zlib.error as e:
+                    raise Malformed(f"zlib block at {r.pos - c}: {e}")
+                if len(raw) != u or z.unconsumed_tail:
+                    raise Malformed(f"zlib block at {r.pos - c} doesn't hold the {u} bytes the table gives")
+                out += raw
             else:
                 if oodle_path is None:
                     raise Malformed("the blocks are compressed with Oodle, pass --oodle with the library")
@@ -167,6 +182,9 @@ def read_tag(r, h):
         extra["inner"], extra["value"] = r.fstring(), r.fstring()
     if h["package_ue4"] >= PROPERTY_GUID_IN_PROPERTY_TAG and r.unpack("<B"):
         r.take(16)
+    # The value has to fit in what is left, which also keeps every tag moving the reader forward.
+    if not 0 <= size <= r.end - r.pos:
+        raise Malformed(f"property {name!r} declares {size} bytes at {r.pos} with {r.end - r.pos} left")
     return name, kind, size, extra
 
 
@@ -179,7 +197,7 @@ def describe(r, h, name, kind, size, extra, depth, indent, out):
     pad = "  " * indent
     end = r.pos + size
     v = Reader(r.data, r.pos, end)
-    label = kind + "".join(f" {extra[k]}" for k in ("struct", "enum", "inner", "value") if k in extra)
+    label = escape(kind + "".join(f" {extra[k]}" for k in ("struct", "enum", "inner", "value") if k in extra))
     value, children = "", None
     try:
         if kind in NUMBERS:
@@ -228,7 +246,12 @@ def describe(r, h, name, kind, size, extra, depth, indent, out):
             if mode == "fields":
                 list_props(cr, h, depth - 1, indent + 1, out)
             else:
+                # Each item reads at least its closing None, so the reader always moves on and
+                # a count larger than the bytes ends here instead of looping.
                 for i in range(count):
+                    if cr.pos >= cr.end:
+                        out.append(f"{pad}  (the array declares {count} items but its bytes end after {i})")
+                        break
                     out.append(f"{pad}  [{i}]")
                     list_props(cr, h, depth - 1, indent + 2, out)
         except Malformed as e:
