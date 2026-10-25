@@ -28,6 +28,8 @@ Skills and helper scripts for Claude Code reverse-engineering work. New skills g
   (`strings`), reads the form resources to map each event to its method (`dfm`) and lists the
   published methods and fields of each class from its VMT, which also works on EXEs without exports
   (`vmt`).
+- `ghidra_scripts/ApplyNames.java`: Ghidra script that names functions from `bpl-xref vmt --names`,
+  creating the ones Ghidra missed, used by the `binary-diff` skill before diffing Delphi executables.
 - `bin/kismet-trace`: reads Unreal Engine blueprint bytecode from a CUE4Parse JSON export. Prints the
   functions as pseudocode with the start of each event marked (`list`), lists the events (`events`)
   and follows one event through the jumps of the ubergraph, branch by branch (`follow`).

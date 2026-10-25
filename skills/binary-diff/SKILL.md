@@ -132,4 +132,35 @@ without addresses or string IDs, which move between builds, so the diff shows on
 added or removed. `--no-geometry` drops `Left`, `Top`, `Width`, `Height` and similar properties,
 which change whenever a form is opened in the designer.
 
+## Delphi executables
+
+An executable without exports or symbols gives ghidriff no names to match on, and Ghidra's analysis
+misses the event handlers that are only reached through a class's published method table, along
+with the code they call. Name those handlers in the project between two ghidriff runs:
+
+```sh
+ghidriff ... -p diff/proj app_1.0.exe app_1.1.exe       # creates and analyzes the project
+bpl-xref vmt --names app_1.0.exe > old.names
+bpl-xref vmt --names app_1.1.exe > new.names
+/opt/ghidra/support/analyzeHeadless diff/proj/ghidriff-app_1.0.exe-app_1.1.exe \
+    ghidriff-app_1.0.exe-app_1.1.exe -process 'app_1.0.exe*' \
+    -scriptPath <this repo>/ghidra_scripts -preScript ApplyNames.java "$PWD/old.names"
+# the same for app_1.1.exe with new.names, then ghidriff again with the same -p
+```
+
+- `ApplyNames.java` names the functions it finds and creates the ones Ghidra doesn't have. As a
+  pre-script, without `-noanalysis`, the analysis that follows also picks up the calls inside the
+  new functions. With `-noanalysis` the names fix the pairing but that code stays out of the diff.
+- ghidriff stores each program with a hash after its name, hence the wildcard in `-process`. The
+  second ghidriff run reuses the analyzed programs and takes seconds.
+- Run `analyzeHeadless` from a directory without a copy of `ApplyNames.java`. A file with the script's
+  name in the current directory is taken first and then refused, because it isn't in a script
+  directory.
+
+On two builds of a Delphi 7 executable, the first run matched 1,396 functions and reported 4
+changed ones, all of them similar event handlers paired with the wrong counterpart, while the real
+changes were in handlers Ghidra hadn't made functions of. After naming 215 published methods, 2,538
+functions matched and the report showed the 2 handlers that really changed and the imports that
+moved to another package.
+
 Delphi packages have their own notes in the `delphi-bpl` skill.

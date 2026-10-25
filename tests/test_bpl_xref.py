@@ -538,6 +538,13 @@ class VmtTest(Fixtures):
         self.assertIn(f"    0x{VA_SAVE:08x} TFOrderEdit.BtnSaveClick (published)", out)
         self.assertIn(f"    0x{VA_SHOW:08x} TFBaseEdit.FormShow (published)", out)
 
+    def test_names_for_ghidra(self):
+        self.assertEqual(self.ok("vmt", "--names", self.exe), "".join(
+            f"0x{va:08x} {name}\n" for va, name in sorted([
+                (VA_SAVE, "TFOrderEdit.BtnSaveClick"), (VA_SHOW, "TFBaseEdit.FormShow"),
+                (VA_CANCEL, "TFOrderEdit.BtnCancelClick")])))
+        self.assertEqual(self.ok("vmt", "--names", self.unicode, "tfbaseedit"), f"0x{VA_SHOW:08x} TFBaseEdit.FormShow\n")
+
     def test_unknown_class(self):
         code, _, err = run("vmt", self.exe, "TNope")
         self.assertEqual(code, 1)

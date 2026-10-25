@@ -1107,6 +1107,18 @@ def cmd_vmt(img, args):
     classes = img.classes()
     if not classes:
         sys.exit("bpl-xref: no VMTs found with the Delphi 2 to 2007 or the Delphi 2009 layout")
+    if args.names:
+        # One "address Class.Method" line per published method, the input of
+        # ghidra_scripts/ApplyNames.java. Names Ghidra can't take are skipped.
+        lines = set()
+        for vmt, cls in classes.items():
+            if args.classes and cls.lower() not in {c.lower() for c in args.classes}:
+                continue
+            for name, va in img.published_methods(vmt):
+                if re.fullmatch(r"[A-Za-z_]\w*", name, re.ASCII):
+                    lines.add((va, f"{cls}.{name}"))
+        print("\n".join(f"0x{va:08x} {name}" for va, name in sorted(lines)))
+        return
     if not args.classes:
         for vmt, name in sorted(classes.items()):
             parent, imported = img.parent(vmt)
@@ -1205,6 +1217,8 @@ def main():
                                    "Exported names don't matter, so it works on EXEs.")
     p.add_argument("file")
     p.add_argument("classes", nargs="*", metavar="class", help="class name (any case)")
+    p.add_argument("--names", action="store_true",
+                   help="print 'address Class.Method' for every published method, for ApplyNames.java")
     p.set_defaults(func=cmd_vmt)
 
     args = ap.parse_args()
