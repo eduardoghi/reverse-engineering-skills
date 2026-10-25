@@ -217,6 +217,15 @@ plugin, and Ghidra 12.1.3 or newer with the ReVa extension for long sessions.
   names the operation, the code you want is the protected block right before it. Script interpreters
   embedded in Delphi programs often dispatch built-in functions this way, so the function's name
   leads to its error handler and the implementation sits just above.
+- **Handlers outside the function in Ghidra.** Ghidra doesn't follow the handler address that the
+  `try` prologue pushes. The function body comes out as two ranges with the handler in the gap
+  between them, the handler belongs to no function and its code isn't disassembled, so the
+  decompiled code shows it only as `&LAB_<handler>` stored in a stack slot. An error message used
+  only in the except block is missing from the decompiled code and Ghidra lists no references to
+  it, while `bpl-xref str` still finds the reference. Disassemble from the `LAB_` address to read
+  the handler. For `on E: EClass do` the handler is `jmp @System@@HandleOnException` followed by a
+  count and pairs of class cell and branch address, so each branch starts at the address in its
+  pair, not after the jump. Checked with Ghidra 12.1.4 on packages.
 - **Floating point width.** `fld`/`fstp` with `tbyte` is `Extended` (10 bytes), `qword` is `Double`
   and `dword` is `Single`. A value that passes through a `Double` parameter or result is no longer
   equal to the same decimal literal held as `Extended`. Compare against a small range when a test
