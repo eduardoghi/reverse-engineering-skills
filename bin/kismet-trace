@@ -189,14 +189,16 @@ class Script:
         self.uber = next((f for f in self.funcs if f["Name"].startswith("ExecuteUbergraph")), None)
         self.entries = {}
         for f in self.funcs:
-            if f is self.uber or len(f.get("ScriptBytecode") or []) > 10:
+            code = f.get("ScriptBytecode") or []
+            if f is self.uber or len(code) > 10:
                 continue
-            for s in f["ScriptBytecode"]:
+            for s in code:
                 if (s.get("Token", "").removeprefix("EX_") in CALLS and short(s.get("Function")).startswith("ExecuteUbergraph")
-                        and s.get("Parameters") and s["Parameters"][0].get("Token") == "EX_IntConst"):
+                        and s.get("Parameters") and s["Parameters"][0].get("Token") == "EX_IntConst"
+                        and is_offset(s["Parameters"][0].get("Value"))):
                     self.entries[f["Name"]] = s["Parameters"][0]["Value"]
         if self.uber:
-            code = self.uber["ScriptBytecode"]
+            code = [s for s in self.uber["ScriptBytecode"] if is_offset(s.get("StatementIndex"))]
             self.at = {s["StatementIndex"]: s for s in code}
             order = [s["StatementIndex"] for s in code]
             self.next = dict(zip(order, order[1:]))
@@ -211,7 +213,11 @@ class Script:
             return hits[0], self.entries[hits[0]]
         if not hits:
             sys.exit(f"kismet-trace: no event named {name!r} (run `events` to list them)")
-        sys.exit(f"kismet-trace: {name!r} matches {len(hits)} events: " + ", ".join(sorted(hits)[:10]))
+        sys.exit(f"kismet-trace: {name!r} matches {len(hits)} events: " + safe(", ".join(sorted(hits)[:10])))
+
+
+def is_offset(value):
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def shown(text, hide):
@@ -259,7 +265,7 @@ def cmd_list(script, args):
                 print(f"\n  ---- entry {idx}: {safe(', '.join(sorted(starts[idx])))}")
             text = r(s)
             if shown(text, args.hide):
-                print(f"  [{idx}] {safe(text)}")
+                print(f"  [{safe(str(idx))}] {safe(text)}")
 
 
 def cmd_events(script, args):
@@ -282,9 +288,13 @@ def cmd_follow(script, args):
         while queue:
             pc, stack, depth, why = queue.pop(0)
             pad = "  " * depth
-            print(f"{pad}-- {why or 'path'} from {pc}")
+            print(f"{pad}-- {why or 'path'} from {safe(repr(pc))}")
             while pc is not None and steps < MAX_STEPS:
                 steps += 1
+                # Jump targets come from the file and can be any JSON value.
+                if not is_offset(pc) or pc not in script.at:
+                    print(f"{pad}   {safe(repr(pc))} is not a statement offset, not followed")
+                    break
                 if pc in printed:
                     print(f"{pad}   (continues as already shown at {pc})")
                     break
@@ -311,7 +321,7 @@ def cmd_follow(script, args):
                     pc = script.next.get(pc)
                     continue
                 if t == "EX_JumpIfNot":
-                    print(f"{pad}   [{pc}] if not ({safe(r(s['BooleanExpression']))}) -> branch {s['CodeOffset']}")
+                    print(f"{pad}   [{pc}] if not ({safe(r(s['BooleanExpression']))}) -> branch {safe(repr(s['CodeOffset']))}")
                     queue.append((s["CodeOffset"], stack, depth + 1, "branch"))
                     pc = script.next.get(pc)
                     continue

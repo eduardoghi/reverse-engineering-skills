@@ -1,9 +1,10 @@
 """Tests for bin/kismet-trace against a small blueprint export built here.
 
-The export imitates what CUE4Parse writes with ReadScriptData set: an
-ExecuteUbergraph function holding two events, the stubs that call it, and a
+The export imitates what CUE4Parse writes with ReadScriptData set, with an
+ExecuteUbergraph function holding two events, the stubs that call it and a
 plain function. Run with `python3 -m unittest discover -s tests`.
 """
+import copy
 import json
 import os
 import subprocess
@@ -113,6 +114,12 @@ class KismetTraceTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         return out
 
+    def write(self, name, exports):
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(exports, fh)
+        return path
+
     def test_events(self):
         self.assertEqual(self.ok("events", self.path), "       0 OnOpen\n      55 OnClose\n")
 
@@ -162,6 +169,36 @@ class KismetTraceTest(unittest.TestCase):
         code, _, err = run("follow", self.path, "On")
         self.assertEqual(code, 1)
         self.assertIn("'On' matches 2 events", err)
+
+    def test_function_without_bytecode_is_skipped(self):
+        # CUE4Parse leaves ScriptBytecode out of functions with no code, such as delegate signatures.
+        path = self.write("signature.json", EXPORTS + [{"Type": "Function", "Name": "OnDoorOpened__DelegateSignature"}])
+        self.assertEqual(self.ok("events", path), "       0 OnOpen\n      55 OnClose\n")
+
+    def test_jump_to_an_offset_that_is_not_a_statement(self):
+        for target, shown in ((71, "71"), ("\x1b[2J", "'\\x1b[2J'"), ([1], "[1]")):
+            with self.subTest(target=target):
+                exports = copy.deepcopy(EXPORTS)
+                jump = next(s for s in exports[0]["ScriptBytecode"] if s["StatementIndex"] == 55)
+                jump["CodeOffset"] = target
+                out = self.ok("follow", self.write("badjump.json", exports), "OnClose")
+                self.assertIn(f"   {shown} is not a statement offset, not followed\n", out)
+                self.assertNotIn("\x1b", out)
+
+    def test_branch_target_from_the_file_is_escaped(self):
+        exports = copy.deepcopy(EXPORTS)
+        branch = next(s for s in exports[0]["ScriptBytecode"] if s["StatementIndex"] == 15)
+        branch["CodeOffset"] = "\x1b]0;x\x07"
+        out = self.ok("follow", self.write("badbranch.json", exports), "OnOpen")
+        self.assertNotIn("\x1b", out)
+        self.assertIn("-> branch '\\x1b]0;x\\x07'", out)
+
+    def test_event_names_in_errors_are_escaped(self):
+        path = self.write("esc.json", EXPORTS + [stub("On\x1b[31mRed", 0)])
+        code, _, err = run("follow", path, "On")
+        self.assertEqual(code, 1)
+        self.assertNotIn("\x1b", err)
+        self.assertIn("On\\x1b[31mRed", err)
 
     def test_export_without_bytecode(self):
         path = os.path.join(self.tmp.name, "nobytecode.json")
