@@ -79,8 +79,8 @@ plugin, and Ghidra 12.1.3 or newer with the ReVa extension for long sessions.
    and every exported method with that name is listed as a candidate. A form whose class has no VMT
    in the file is usually one the linker kept after dropping its class, so no code runs it.
 
-   `bpl-xref vmt` reads the same VMTs (Delphi 2 to 2007 layout) without exports. Without a class it
-   lists every class with its parent. With one it prints the published methods and the published
+   `bpl-xref vmt` reads the same VMTs without exports, in the layout of Delphi 2 to 2007 or of Delphi
+   2009 and later, which it picks from the file. Without a class it lists every class with its parent. With one it prints the published methods and the published
    fields with their offsets, so `mov eax, [ebx+0x3a0]` in a form method is `edtCustomer: TEdit`:
 
    ```sh
@@ -232,8 +232,8 @@ plugin, and Ghidra 12.1.3 or newer with the ReVa extension for long sessions.
   checks a computed float.
 - **Class references.** A `mov eax, [abs]` before a constructor, an `IsClass` or a factory call loads a
   class pointer from a cell. For an imported class the cell is the import slot. For a class defined in
-  the package the cell is the `vmtSelfPtr` at VMT minus 0x4C, which holds the VMT's own address, and the
-  class name is the ShortString just before the VMT. The class pointer is the VMT address.
+  the package the cell is the `vmtSelfPtr` at VMT minus 0x4C (0x58 from Delphi 2009 on), which holds
+  the VMT's own address, and the class name is the ShortString just before the VMT. The class pointer is the VMT address.
   `IsClass(obj, cls)` takes the object in `eax` and the class in `edx` and answers in `al`.
 - **Library objects that the package doesn't import methods for.** The fields of VCL classes sit at fixed
   offsets for a given compiler, so code you inject can read them directly. In the Delphi 7 era layout a

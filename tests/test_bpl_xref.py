@@ -105,11 +105,13 @@ def imports(data, dll, names):
     return desc, 40, slots
 
 
-def vmt(data, name, parent_cell=0, methods=(), fields=(), field_types=()):
-    """Write a Delphi 7 VMT and its tables. Returns (VMT address, class cell).
+def vmt(data, name, parent_cell=0, methods=(), fields=(), field_types=(), slot_count=19):
+    """Write a VMT and its tables. Returns (VMT address, class cell).
 
-    The class cell is the vmtSelfPtr slot, which holds the VMT address, the way
-    Delphi refers to a class defined in the same module.
+    slot_count is the number of dwords before the VMT, 19 up to Delphi 2007
+    and 22 from Delphi 2009 on. The first eleven keep their order in both.
+    The class cell is the vmtSelfPtr slot, which holds the VMT address, the
+    way Delphi refers to a class defined in the same module.
     """
     name_va = data.put(short_string(name))
     method_table = field_table = 0
@@ -131,8 +133,8 @@ def vmt(data, name, parent_cell=0, methods=(), fields=(), field_types=()):
             data.put(short_string(field))
     data.align()
     cell = data.va
-    address = cell + 0x4C
-    slots = [0] * 19
+    address = cell + 4 * slot_count
+    slots = [0] * slot_count
     slots[0], slots[5], slots[6], slots[8], slots[9], slots[10] = (
         address, field_table, method_table, name_va, 0x3B0, parent_cell)
     for value in slots:
@@ -290,7 +292,7 @@ def write_pe(path, sections, dirs, dll):
             fh.write(body + b"\0" * (raw_size - len(body)))
 
 
-def build(path, with_exports, with_relocs):
+def build(path, with_exports, with_relocs, slot_count=19):
     """Write a fixture and return the addresses the tests check."""
     data = Section(DATA_RVA)
     module_var = data.u32(0)
@@ -306,12 +308,13 @@ def build(path, with_exports, with_relocs):
     import_dir = imports(data, "vcl70.bpl", ["@Forms@TForm@", "@Stdctrls@TButton@",
                                              "@Dialogs@ShowMessage$qqrx17System@AnsiString"])
     slots = import_dir[2]
-    helper, helper_cell = vmt(data, "THelper")
-    base, base_cell = vmt(data, "TFBaseEdit", slots["@Forms@TForm@"], methods=[("FormShow", VA_SHOW)])
+    helper, helper_cell = vmt(data, "THelper", slot_count=slot_count)
+    base, base_cell = vmt(data, "TFBaseEdit", slots["@Forms@TForm@"], methods=[("FormShow", VA_SHOW)],
+                          slot_count=slot_count)
     edit, _ = vmt(data, "TFOrderEdit", base_cell,
                   methods=[("BtnSaveClick", VA_SAVE), ("BtnCancelClick", VA_CANCEL)],
                   fields=[(0x3A4, 0, "BtnSave"), (0x3A8, 1, "Helper")],
-                  field_types=[slots["@Stdctrls@TButton@"], helper_cell])
+                  field_types=[slots["@Stdctrls@TButton@"], helper_cell], slot_count=slot_count)
     dirs = {1: import_dir[:2]}
     if with_exports:
         # BtnCancelClick stays unexported so the BPL resolves it through the VMT.
@@ -383,9 +386,11 @@ class Fixtures(unittest.TestCase):
         cls.bpl = os.path.join(cls.tmp.name, "orders.bpl")
         cls.exe = os.path.join(cls.tmp.name, "orders.exe")
         cls.bare = os.path.join(cls.tmp.name, "norelocs.exe")
+        cls.unicode = os.path.join(cls.tmp.name, "d2009.exe")
         cls.at = build(cls.bpl, with_exports=True, with_relocs=True)
         build(cls.exe, with_exports=False, with_relocs=True)
         build(cls.bare, with_exports=False, with_relocs=False)
+        cls.at_unicode = build(cls.unicode, with_exports=False, with_relocs=True, slot_count=22)
 
     @classmethod
     def tearDownClass(cls):
@@ -524,6 +529,14 @@ class VmtTest(Fixtures):
         self.assertIn(f"  TFOrderEdit\n    0x{VA_SAVE:08x} BtnSaveClick\n    0x{VA_CANCEL:08x} BtnCancelClick\n"
                       "    +0x3a4 BtnSave: TButton\n    +0x3a8 Helper: THelper", out)
         self.assertIn(f"  TFBaseEdit\n    0x{VA_SHOW:08x} FormShow", out)
+
+    def test_delphi_2009_layout(self):
+        out = self.ok("vmt", self.unicode, "TFOrderEdit")
+        self.assertIn(f"0x{self.at_unicode['edit']:08x} TFOrderEdit < TFBaseEdit < @Forms@TForm@ in vcl70.bpl", out)
+        self.assertIn("    +0x3a4 BtnSave: TButton\n    +0x3a8 Helper: THelper", out)
+        out = self.ok("dfm", "--events", self.unicode)
+        self.assertIn(f"    0x{VA_SAVE:08x} TFOrderEdit.BtnSaveClick (published)", out)
+        self.assertIn(f"    0x{VA_SHOW:08x} TFBaseEdit.FormShow (published)", out)
 
     def test_unknown_class(self):
         code, _, err = run("vmt", self.exe, "TNope")

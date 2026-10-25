@@ -42,13 +42,12 @@ DFM_SIGNATURE = b"TPF0"
 DFM_GEOMETRY = {"Left", "Top", "Width", "Height", "ClientWidth", "ClientHeight", "ExplicitLeft",
                 "ExplicitTop", "ExplicitWidth", "ExplicitHeight", "DesignSize"}
 MAX_CANDIDATES = 10
-# VMT slots of Delphi 2 to 2007, as offsets from the class pointer. Delphi
-# 2009 added three virtual methods in front of them and moved every slot.
-VMT_SELF_PTR = -0x4C
-VMT_FIELD_TABLE = -0x38
-VMT_METHOD_TABLE = -0x34
-VMT_CLASS_NAME = -0x2C
-VMT_PARENT = -0x24
+# VMT slots as offsets from the class pointer. Delphi 2009 added three virtual
+# methods between vmtParent and the VMT, which moved every slot 12 bytes back.
+VMT_LAYOUTS = {
+    "Delphi 2 to 2007": {"self": -0x4C, "fields": -0x38, "methods": -0x34, "name": -0x2C, "parent": -0x24},
+    "Delphi 2009 or later": {"self": -0x58, "fields": -0x44, "methods": -0x40, "name": -0x38, "parent": -0x30},
+}
 # Code page of AnsiString literals and form strings, the Windows ANSI code
 # page of Western European and Brazilian installs. Unlike latin-1 it maps
 # 0x80-0x9F to printable characters such as curly quotes and dashes.
@@ -95,6 +94,8 @@ class Image:
         self.funcs = self._exported_functions()
         self.func_addrs = [a for a, _ in self.funcs]
         self._classes = None
+        self.vmt_layout = None
+        self.vmt = VMT_LAYOUTS["Delphi 2 to 2007"]  # replaced once classes() has scanned the file
         self._iat = None
         self._strings = None
         self._records = None
@@ -424,7 +425,9 @@ class Image:
         """Map each VMT address to its class name.
 
         A VMT starts with vmtSelfPtr, which holds the VMT address itself, so
-        a dword equal to its own address plus 0x4C marks a candidate. With a
+        a dword equal to its own address plus 0x4C (0x58 from Delphi 2009 on)
+        marks a candidate, kept when the class name slot of that layout points
+        at a name. The layout with more classes wins and sets self.vmt. With a
         relocation table only relocated dwords are checked.
         """
         if self._classes is not None:
@@ -433,12 +436,16 @@ class Image:
             slots = ((self.base + rva, self.read_u32(self.base + rva)) for rva in self.relocs)
         else:
             slots = self._aligned_dwords()
-        self._classes = {}
+        found = {layout: {} for layout in VMT_LAYOUTS}
         for va, value in slots:
-            if value == va - VMT_SELF_PTR:
-                name = self.ident_at(self.read_u32(value + VMT_CLASS_NAME))
-                if name:
-                    self._classes[value] = name
+            for layout, offsets in VMT_LAYOUTS.items():
+                if value == va - offsets["self"]:
+                    name = self.ident_at(self.read_u32(value + offsets["name"]))
+                    if name:
+                        found[layout][value] = name
+        self.vmt_layout = max(found, key=lambda layout: len(found[layout]))
+        self.vmt = VMT_LAYOUTS[self.vmt_layout]
+        self._classes = found[self.vmt_layout]
         return self._classes
 
     def _aligned_dwords(self):
@@ -454,7 +461,7 @@ class Image:
         vmtParent points at a cell that holds the parent's class pointer. For a
         class from another package the cell is an import slot.
         """
-        cell = self.read_u32(vmt + VMT_PARENT)
+        cell = self.read_u32(vmt + self.vmt["parent"])
         if not cell:
             return None, None
         if cell in self.iat():
@@ -482,7 +489,7 @@ class Image:
         Each entry is a 16-bit entry size, the code address and a ShortString
         name. The size steps over any data after the name.
         """
-        off = self._table(self.read_u32(vmt + VMT_METHOD_TABLE))
+        off = self._table(self.read_u32(vmt + self.vmt["methods"]))
         if off is None:
             return []
         data, methods = self.data, []
@@ -505,7 +512,7 @@ class Image:
         entries of a 32-bit offset, a 16-bit index into the class table and a
         ShortString name. The class table holds cells, like vmtParent.
         """
-        off = self._table(self.read_u32(vmt + VMT_FIELD_TABLE))
+        off = self._table(self.read_u32(vmt + self.vmt["fields"]))
         if off is None or off + 6 > len(self.data):
             return []
         data = self.data
@@ -1099,7 +1106,7 @@ def published_handler(img, owner, handler):
 def cmd_vmt(img, args):
     classes = img.classes()
     if not classes:
-        sys.exit("bpl-xref: no VMTs found (only the Delphi 2 to 2007 layout is read)")
+        sys.exit("bpl-xref: no VMTs found with the Delphi 2 to 2007 or the Delphi 2009 layout")
     if not args.classes:
         for vmt, name in sorted(classes.items()):
             parent, imported = img.parent(vmt)
@@ -1190,7 +1197,7 @@ def main():
     p.set_defaults(func=cmd_dfm)
 
     p = sub.add_parser("vmt", help="list classes or print their published methods and fields",
-                       description="Find class VMTs (Delphi 2 to 2007 layout) through vmtSelfPtr. "
+                       description="Find class VMTs (Delphi 2 to 2007 and 2009 or later layouts) through vmtSelfPtr. "
                                    "Without CLASS, list every class with its parent and the size of "
                                    "its published tables. With CLASS, print the class and its "
                                    "ancestors in this file with each published method address and "
