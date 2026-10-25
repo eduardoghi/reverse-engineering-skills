@@ -141,8 +141,8 @@ switch (cmd)
 5. **Connect events to actors in the JSON.** Events bound to a placed actor are named
    `BndEvt__<Actor>_K2Node_..._<Delegate>`, with the actor name from when the event was created. If
    the actor was renamed later, the name in the function is stale. The binding that counts is in the
-   actor itself, in the `InvocationList` of its delegate property (`OnActorBeginOverlap`,
-   `OnPawnSpawned...`), which names the function. Component positions (`RelativeLocation`) are
+   actor itself, in the `InvocationList` of its delegate property (`OnActorBeginOverlap`, for
+   example), which names the function. Component positions (`RelativeLocation`) are
    relative to their `AttachParent`, so add up the chain to place a trigger or waypoint in the world.
 
 ## Bugs that appear after loading a save
@@ -153,8 +153,9 @@ for state that the normal flow builds and the restore path doesn't:
 - When the game saves actors through Unreal's SaveGame flag, the properties with `SaveGame` in their
   `PropertyFlags` are the blueprint variables that come back from the save. Everything else starts
   from its default after a load.
-- Compare what the restore events run (`OnRestoreCheckpoint`, `ReceivePreSaveGameLoaded` or the
-  game's equivalents) with the normal start. A delegate bound only in the normal flow (`+=` or
+- Compare what the events the game calls on a restore run with the normal start. They are the game's
+  own (one game named them `OnRestoreCheckpoint` and `ReceivePreSaveGameLoaded`), so look for them
+  in `kismet-trace events`. A delegate bound only in the normal flow (`+=` or
   `bind` in `follow`) is never bound after a load, and whatever waits on it never fires.
 - An overlap event that doesn't check which actor entered fires for NPCs and vehicles too. Combined
   with a DoOnce gate, one wrong overlap can use up the only trigger.
@@ -180,12 +181,12 @@ ue-save props slot1.sav --oodle oodle-data-shared.dll --depth 2    # fields of s
 ue-save unpack slot1.sav slot1.gvas --oodle oodle-data-shared.dll  # the plain GVAS, for a hex editor
 ```
 
-Use the Oodle library the exporter downloaded. `ue-save` works out from the bytes which optional
-parts a save has, because the header can't be trusted for it. One game built on UE 4.11 declared
-package version 500 but wrote no custom version block, no GUID byte after each property tag and no
-inner tag before the items of struct arrays. Games can also append their own data after the
-property list, and `props` says how many bytes follow it. Property tags of UE 5.4 and newer use a
-different layout and are refused.
+Use the Oodle library the exporter downloaded. `ue-save` works out from the bytes whether a save has
+the custom version block and the tag before the items of struct arrays, because the header can't be
+trusted for them. One game built on UE 4.11 declared package version 500, from which Unreal writes
+that tag, but its saves had none, and its header had no custom version block. Games can also append
+their own data after the property list, and `props` says how many bytes follow it. Property tags of
+UE 5.4 and newer use a different layout and are refused.
 
 Work on copies. Before putting a save from elsewhere in the game's folder, back up the folder and
 turn off Steam Cloud for the game, or the swapped save can be uploaded over the real one.
