@@ -14,6 +14,8 @@ Skills and helper scripts for Claude Code reverse-engineering work. New skills g
   trampolines in unused space, test it with unicorn and describe the patch as byte patterns.
 - `skills/wine-debugging`: find why a Windows program is slow or dies under Wine on Linux, measure what
   a network share and the font engine cost, and capture a silent crash.
+- `skills/unreal-engine`: go from what a player sees in an Unreal Engine 4 game to the map or blueprint
+  behind it, export it with CUE4Parse and read its bytecode with `kismet-trace`.
 
 ## Scripts
 
@@ -45,6 +47,7 @@ ln -sfn "$PWD/bin/kismet-trace" ~/.local/bin/kismet-trace
 ln -sfn "$PWD/skills/binary-diff" ~/.claude/skills/binary-diff
 ln -sfn "$PWD/skills/binary-patch" ~/.claude/skills/binary-patch
 ln -sfn "$PWD/skills/wine-debugging" ~/.claude/skills/wine-debugging
+ln -sfn "$PWD/skills/unreal-engine" ~/.claude/skills/unreal-engine
 java-decompile --check
 bpl-xref --help > /dev/null && echo 'bpl-xref ok'   # fails if pefile is missing
 ```
@@ -61,6 +64,11 @@ Requirements for `delphi-bpl`:
 - Python 3 with `pefile` (`pacman -S python-pefile`)
 - rizin with the rz-ghidra plugin (`pacman -S rizin rz-ghidra`)
 - Optional, for long sessions: Ghidra 12.1.3 or newer and the ReVa extension
+
+Requirements for `unreal-engine`:
+
+- The .NET 10 SDK to build CUE4Parse and the small exporter the skill shows
+- `kismet-trace`, below
 
 Requirements for `kismet-trace`:
 
