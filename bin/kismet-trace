@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+"""Read Unreal Engine blueprint bytecode (Kismet) from a CUE4Parse JSON export.
+
+  kismet-trace list FILE [FUNCTION...]   functions as pseudocode, event entries marked
+  kismet-trace events FILE               event functions and where their code starts
+  kismet-trace follow FILE EVENT...      the statements one event runs, branch by branch
+
+FILE is the JSON CUE4Parse writes for a package (its list of exports) with
+the script bytecode included, which needs ReadScriptData set on the provider.
+
+A blueprint compiles all of its event graphs into one ExecuteUbergraph
+function. Each event is a small stub that calls it with the offset where its
+code starts, and the code inside is held together by jumps and an execution
+flow stack. `follow` starts at that offset, follows the jumps, emulates the
+stack and prints each branch on its own.
+"""
+import argparse
+import json
+import re
+import sys
+
+MAX_STEPS = 20000
+
+
+def safe(text):
+    """Escape characters that aren't printable. Names and strings come from the game files."""
+    return "".join(c if c.isprintable() else f"\\x{ord(c):02x}" for c in text)
+
+
+def short(obj):
+    """Display name of a property, function or object reference.
+
+    `Function'Class:Name'` becomes `Name`, a class default object loses its
+    `Default__` prefix and a property keeps its own name.
+    """
+    if isinstance(obj, str):
+        return obj
+    if not isinstance(obj, dict):
+        return str(obj)
+    if "Name" in obj and "Type" in obj:
+        return obj["Name"]
+    name = obj.get("ObjectName", "")
+    m = re.fullmatch(r"\w+'(.*)'", name)
+    name = m.group(1) if m else name
+    return name.rsplit(":", 1)[-1].replace("Default__", "")
+
+
+def args_of(e):
+    return ", ".join(r(p) for p in e.get("Parameters", []))
+
+
+def value_text(v):
+    if isinstance(v, dict):
+        if all(k in v for k in ("X", "Y", "Z")):
+            return f"({v['X']}, {v['Y']}, {v['Z']})"
+        if all(k in v for k in ("Pitch", "Yaw", "Roll")):
+            return f"(P {v['Pitch']}, Y {v['Yaw']}, R {v['Roll']})"
+        for key in ("SourceString", "LocalizedString", "CultureInvariantString", "Text"):
+            if isinstance(v.get(key), str):
+                return repr(v[key])
+        return json.dumps(v, ensure_ascii=False)[:80]
+    return repr(v) if isinstance(v, str) else str(v)
+
+
+VARIABLES = {"LocalVariable", "InstanceVariable", "LocalOutVariable", "DefaultVariable", "ClassSparseDataVariable"}
+CALLS = {"FinalFunction", "VirtualFunction", "CallMath", "LocalFinalFunction", "LocalVirtualFunction"}
+LETS = {"Let", "LetObj", "LetBool", "LetWeakObjPtr", "LetDelegate", "LetMulticastDelegate"}
+NUMBERS = {"IntConst", "FloatConst", "DoubleConst", "ByteConst", "IntConstByte", "SkipOffsetConst",
+           "Int64Const", "UInt64Const"}
+CASTS = {"ObjToInterfaceCast", "DynamicCast", "MetaCast", "CrossInterfaceCast", "InterfaceToObjCast"}
+# Markers and debugging hooks that produce no statement of their own.
+SILENT = {"EndOfScript", "Nothing", "NothingInt32", "EndFunctionParms", "Breakpoint", "Tracepoint",
+          "WireTracepoint", "InstrumentationEvent"}
+
+
+def r(e):
+    """Render one expression or statement as pseudocode."""
+    if e is None:
+        return ""
+    if not isinstance(e, dict) or "Token" not in e:
+        return short(e)
+    t = e["Token"].removeprefix("EX_")
+    if t in VARIABLES:
+        return short(e["Variable"])
+    if t in ("Context", "ClassContext"):
+        return f"{r(e['ObjectExpression'])}.{r(e['ContextExpression'])}"
+    if t == "Context_FailSilent":
+        return f"{r(e['ObjectExpression'])}?.{r(e['ContextExpression'])}"
+    if t in CALLS:
+        return f"{short(e['Function'])}({args_of(e)})"
+    if t == "CallMulticastDelegate":
+        return f"{r(e['Delegate'])}.Broadcast({args_of(e)})"
+    if t in LETS:
+        return f"{r(e.get('Variable', e.get('Property')))} = {r(e['Expression'])}"
+    if t == "LetValueOnPersistentFrame":
+        return f"{short(e['DestinationProperty'])} = {r(e['AssignmentExpression'])}"
+    if t == "Jump":
+        return f"goto {e['CodeOffset']}"
+    if t == "JumpIfNot":
+        return f"if not ({r(e['BooleanExpression'])}) goto {e['CodeOffset']}"
+    if t == "PushExecutionFlow":
+        return f"push {e['PushingAddress']}"
+    if t == "PopExecutionFlow":
+        return "pop"
+    if t == "PopExecutionFlowIfNot":
+        return f"if not ({r(e['BooleanExpression'])}) pop"
+    if t == "ComputedJump":
+        return f"goto ({r(e['CodeOffsetExpression'])})"
+    if t == "Skip":
+        return f"skip to {e.get('CodeOffset')} ({r(e.get('SkipExpression'))})"
+    if t == "Return":
+        return f"return {r(e.get('Expression'))}".rstrip()
+    if t in SILENT:
+        return ""
+    if t in NUMBERS:
+        return str(e["Value"])
+    if t == "IntZero":
+        return "0"
+    if t == "IntOne":
+        return "1"
+    if t in ("StringConst", "UnicodeStringConst", "NameConst"):
+        return repr(e["Value"])
+    if t in ("True", "False"):
+        return t.lower()
+    if t == "Self":
+        return "self"
+    if t in ("NoObject", "NoInterface"):
+        return "None"
+    if t in ("ObjectConst", "SoftObjectConst", "FieldPathConst"):
+        return short(e["Value"])
+    if t in ("VectorConst", "Vector3fConst", "RotationConst", "TransformConst", "TextConst"):
+        return value_text(e.get("Value"))
+    if t == "PropertyConst":
+        return short(e["Property"])
+    if t == "BitFieldConst":
+        return str(e["ConstValue"])
+    if t == "StructMemberContext":
+        return f"{r(e['StructExpression'])}.{short(e['Property'])}"
+    if t == "Cast":
+        return f"cast({r(e['Target'])})"
+    if t in CASTS:
+        return f"cast<{short(e.get('InterfaceClass'))}>({r(e['Target'])})"
+    if t == "InterfaceContext":
+        return r(e["InterfaceValue"])
+    if t == "BindDelegate":
+        return f"bind {r(e['Delegate'])} -> {r(e['ObjectTerm'])}.{e['FunctionName']}"
+    if t == "AddMulticastDelegate":
+        return f"{r(e['MulticastDelegate'])} += {r(e['Delegate'])}"
+    if t == "RemoveMulticastDelegate":
+        return f"{r(e['MulticastDelegate'])} -= {r(e['Delegate'])}"
+    if t == "ClearMulticastDelegate":
+        return f"{r(e['DelegateToClear'])}.Clear()"
+    if t == "InstanceDelegate":
+        return f"&{e['FunctionName']}"
+    if t == "SetArray":
+        return f"{r(e['AssigningProperty'])} = [{', '.join(r(x) for x in e['Elements'])}]"
+    if t == "SetSet":
+        return f"{r(e['SetProperty'])} = {{{', '.join(r(x) for x in e['Elements'])}}}"
+    if t == "SetMap":
+        pairs = ", ".join(f"{r(p['Key'])}: {r(p['Value'])}" for p in e["Values"])
+        return f"{r(e['MapProperty'])} = {{{pairs}}}"
+    if t == "ArrayConst":
+        return f"[{', '.join(r(x) for x in e['Values'])}]"
+    if t == "SetConst":
+        return f"{{{', '.join(r(x) for x in e['Elements'])}}}"
+    if t == "MapConst":
+        return "{" + ", ".join(f"{r(p['Key'])}: {r(p['Value'])}" for p in e["Values"]) + "}"
+    if t == "ArrayGetByRef":
+        return f"{r(e['ArrayVariable'])}[{r(e['ArrayIndex'])}]"
+    if t == "StructConst":
+        return f"{short(e['Struct'])}{{{', '.join(r(x) for x in e['Properties'])}}}"
+    if t == "SwitchValue":
+        cases = ", ".join(f"{r(c['CaseIndexValueTerm'])}: {r(c['CaseTerm'])}" for c in e["Cases"])
+        return f"switch({r(e['IndexTerm'])}) {{{cases}, default: {r(e['DefaultTerm'])}}}"
+    return f"<{e['Token']} {sorted(k for k in e if k not in ('Token', 'StatementIndex'))}>"
+
+
+class Script:
+    def __init__(self, path):
+        try:
+            exports = json.load(open(path, encoding="utf-8"))
+        except (OSError, ValueError) as err:
+            sys.exit(f"kismet-trace: {path}: {err}")
+        if not isinstance(exports, list):
+            sys.exit(f"kismet-trace: {path}: expected the list of exports CUE4Parse writes")
+        self.funcs = [e for e in exports if isinstance(e, dict) and e.get("Type") == "Function"]
+        if not any(f.get("ScriptBytecode") for f in self.funcs):
+            sys.exit(f"kismet-trace: {path}: no function has ScriptBytecode (export with ReadScriptData set)")
+        self.uber = next((f for f in self.funcs if f["Name"].startswith("ExecuteUbergraph")), None)
+        self.entries = {}
+        for f in self.funcs:
+            if f is self.uber or len(f.get("ScriptBytecode") or []) > 10:
+                continue
+            for s in f["ScriptBytecode"]:
+                if (s.get("Token", "").removeprefix("EX_") in CALLS and short(s.get("Function")).startswith("ExecuteUbergraph")
+                        and s.get("Parameters") and s["Parameters"][0].get("Token") == "EX_IntConst"):
+                    self.entries[f["Name"]] = s["Parameters"][0]["Value"]
+        if self.uber:
+            code = self.uber["ScriptBytecode"]
+            self.at = {s["StatementIndex"]: s for s in code}
+            order = [s["StatementIndex"] for s in code]
+            self.next = dict(zip(order, order[1:]))
+
+    def event_offset(self, name):
+        if name.isdigit():
+            return int(name), int(name)
+        if name in self.entries:
+            return name, self.entries[name]
+        hits = [n for n in self.entries if name.lower() in n.lower()]
+        if len(hits) == 1:
+            return hits[0], self.entries[hits[0]]
+        if not hits:
+            sys.exit(f"kismet-trace: no event named {name!r} (run `events` to list them)")
+        sys.exit(f"kismet-trace: {name!r} matches {len(hits)} events: " + ", ".join(sorted(hits)[:10]))
+
+
+def shown(text, hide):
+    return text and not any(h.search(text) for h in hide)
+
+
+def latent_resume(s, uber_name):
+    """Offset where a latent action (Delay and the like) resumes this event later, or None."""
+    found = []
+
+    def walk(e):
+        if isinstance(e, dict):
+            # The linkage, the first field, is written as a skip offset or an int.
+            if (e.get("Token") == "EX_StructConst" and short(e.get("Struct")) == "LatentActionInfo"
+                    and len(e.get("Properties", [])) >= 3
+                    and e["Properties"][0].get("Token") in ("EX_SkipOffsetConst", "EX_IntConst")
+                    and e["Properties"][2].get("Value") == uber_name):
+                found.append(e["Properties"][0]["Value"])
+            for v in e.values():
+                walk(v)
+        elif isinstance(e, list):
+            for v in e:
+                walk(v)
+
+    walk(s)
+    return found[0] if found else None
+
+
+def cmd_list(script, args):
+    wanted = set(args.functions)
+    names = {f["Name"] for f in script.funcs}
+    missing = wanted - names
+    if missing:
+        sys.exit(f"kismet-trace: no function named {', '.join(sorted(missing))}")
+    starts = {}
+    for name, off in script.entries.items():
+        starts.setdefault(off, []).append(name)
+    for f in script.funcs:
+        if wanted and f["Name"] not in wanted or not f.get("ScriptBytecode"):
+            continue
+        print(f"\n=== {safe(f['Name'])}")
+        for s in f["ScriptBytecode"]:
+            idx = s.get("StatementIndex")
+            if f is script.uber and idx in starts:
+                print(f"\n  ---- entry {idx}: {safe(', '.join(sorted(starts[idx])))}")
+            text = r(s)
+            if shown(text, args.hide):
+                print(f"  [{idx}] {safe(text)}")
+
+
+def cmd_events(script, args):
+    for name, off in sorted(script.entries.items(), key=lambda x: x[1]):
+        print(f"{off:8} {safe(name)}")
+
+
+def cmd_follow(script, args):
+    if not script.uber:
+        sys.exit("kismet-trace: the file has no ExecuteUbergraph function")
+    uber_name = script.uber["Name"]
+    for arg in args.events:
+        name, start = script.event_offset(arg)
+        if start not in script.at:
+            sys.exit(f"kismet-trace: {start} is not a statement offset in {uber_name}")
+        print(f"\n######## {safe(str(name))} @ {start}")
+        printed = set()
+        queue = [(start, (), 0, "")]
+        steps = 0
+        while queue:
+            pc, stack, depth, why = queue.pop(0)
+            pad = "  " * depth
+            print(f"{pad}-- {why or 'path'} from {pc}")
+            while pc is not None and steps < MAX_STEPS:
+                steps += 1
+                if pc in printed:
+                    print(f"{pad}   (continues as already shown at {pc})")
+                    break
+                printed.add(pc)
+                s = script.at[pc]
+                t = s["Token"]
+                if t == "EX_Jump":
+                    pc = s["CodeOffset"]
+                    continue
+                if t == "EX_PushExecutionFlow":
+                    stack += (s["PushingAddress"],)
+                    pc = script.next.get(pc)
+                    continue
+                if t == "EX_PopExecutionFlow":
+                    if not stack:
+                        print(f"{pad}   [{pc}] end")
+                        break
+                    pc, stack = stack[-1], stack[:-1]
+                    continue
+                if t == "EX_PopExecutionFlowIfNot":
+                    print(f"{pad}   [{pc}] if not ({safe(r(s['BooleanExpression']))}) -> end of this flow")
+                    if stack:
+                        queue.append((stack[-1], stack[:-1], depth + 1, "after the flow ends, path"))
+                    pc = script.next.get(pc)
+                    continue
+                if t == "EX_JumpIfNot":
+                    print(f"{pad}   [{pc}] if not ({safe(r(s['BooleanExpression']))}) -> branch {s['CodeOffset']}")
+                    queue.append((s["CodeOffset"], stack, depth + 1, "branch"))
+                    pc = script.next.get(pc)
+                    continue
+                if t == "EX_ComputedJump":
+                    print(f"{pad}   [{pc}] {safe(r(s))} (target computed at run time, not followed)")
+                    break
+                if t in ("EX_Return", "EX_EndOfScript"):
+                    print(f"{pad}   [{pc}] return")
+                    break
+                text = r(s)
+                if shown(text, args.hide):
+                    print(f"{pad}   [{pc}] {safe(text)}")
+                resume = latent_resume(s, uber_name)
+                if resume is not None and resume in script.at:
+                    queue.append((resume, (), depth + 1, "resumes later"))
+                pc = script.next.get(pc)
+            if steps >= MAX_STEPS:
+                print(f"kismet-trace: stopped after {MAX_STEPS} statements", file=sys.stderr)
+                break
+
+
+def main():
+    head, tail = __doc__.split("\n\n", 1)
+    ap = argparse.ArgumentParser(prog="kismet-trace", description=head, epilog=tail,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True, metavar="command")
+
+    def common(p):
+        p.add_argument("file", help="CUE4Parse JSON export of a blueprint, map or class")
+        p.add_argument("--hide", action="append", default=[], metavar="REGEX", type=re.compile,
+                       help="leave out statements matching REGEX (repeatable), such as DoOnce bookkeeping")
+
+    p = sub.add_parser("list", help="print functions as pseudocode",
+                       description="Print each function with bytecode as pseudocode, one statement per "
+                                   "line with its offset. In the ubergraph, the offset where each event "
+                                   "starts is marked with the event's name.")
+    common(p)
+    p.add_argument("functions", nargs="*", metavar="function", help="exact function name")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("events", help="list event functions and their ubergraph offsets")
+    common(p)
+    p.set_defaults(func=cmd_events)
+
+    p = sub.add_parser("follow", help="print the statements an event runs",
+                       description="Start at the ubergraph offset of each event, follow jumps and the "
+                                   "execution flow stack and print each path once. The target of every "
+                                   "`if not (...)` is printed afterwards as its own branch, and the point "
+                                   "where a latent action such as Delay resumes as a later path. A "
+                                   "statement already printed is not repeated.")
+    common(p)
+    p.add_argument("events", nargs="+", metavar="event", help="event name, part of one, or an offset")
+    p.set_defaults(func=cmd_follow)
+
+    args = ap.parse_args()
+    args.func(Script(args.file), args)
+
+
+if __name__ == "__main__":
+    main()

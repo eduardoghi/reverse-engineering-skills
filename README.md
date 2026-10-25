@@ -26,6 +26,9 @@ Skills and helper scripts for Claude Code reverse-engineering work. New skills g
   (`strings`), reads the form resources to map each event to its method (`dfm`) and lists the
   published methods and fields of each class from its VMT, which also works on EXEs without exports
   (`vmt`).
+- `bin/kismet-trace`: reads Unreal Engine blueprint bytecode from a CUE4Parse JSON export. Prints the
+  functions as pseudocode with the start of each event marked (`list`), lists the events (`events`)
+  and follows one event through the jumps of the ubergraph, branch by branch (`follow`).
 
 ## Setup
 
@@ -38,6 +41,7 @@ ln -sfn "$PWD/skills/java-decompile" ~/.claude/skills/java-decompile
 ln -sfn "$PWD/bin/java-decompile" ~/.local/bin/java-decompile
 ln -sfn "$PWD/skills/delphi-bpl" ~/.claude/skills/delphi-bpl
 ln -sfn "$PWD/bin/bpl-xref" ~/.local/bin/bpl-xref
+ln -sfn "$PWD/bin/kismet-trace" ~/.local/bin/kismet-trace
 ln -sfn "$PWD/skills/binary-diff" ~/.claude/skills/binary-diff
 ln -sfn "$PWD/skills/binary-patch" ~/.claude/skills/binary-patch
 ln -sfn "$PWD/skills/wine-debugging" ~/.claude/skills/wine-debugging
@@ -57,6 +61,12 @@ Requirements for `delphi-bpl`:
 - Python 3 with `pefile` (`pacman -S python-pefile`)
 - rizin with the rz-ghidra plugin (`pacman -S rizin rz-ghidra`)
 - Optional, for long sessions: Ghidra 12.1.3 or newer and the ReVa extension
+
+Requirements for `kismet-trace`:
+
+- Python 3, standard library only
+- A JSON export from [CUE4Parse](https://github.com/FabianFG/CUE4Parse) made with `ReadScriptData`
+  set on the provider, so the functions carry their bytecode
 
 Requirements for `binary-diff`:
 
@@ -90,6 +100,10 @@ bpl-xref dfm app.bpl TFORDEREDIT
 bpl-xref dfm --events app.bpl
 bpl-xref dfm --all --no-geometry app.bpl > app.dfm
 bpl-xref strings app.bpl > app.txt
+
+kismet-trace events Level.umap.json
+kismet-trace list Level.umap.json --hide DoOnce
+kismet-trace follow Level.umap.json OnDoorOpened
 bpl-xref vmt app.exe TFORDEREDIT
 ```
 
@@ -102,8 +116,9 @@ bpl-xref vmt app.exe TFORDEREDIT
 python3 -m unittest discover -s tests
 ```
 
-The tests build small PE files in code and run `bpl-xref` on them, so they need `pefile` but no real
-binaries. Without `pefile` they are skipped.
+The tests build their inputs in code (small PE files for `bpl-xref`, a blueprint export for
+`kismet-trace`), so no real binaries or games are needed. The `bpl-xref` tests need `pefile` and are
+skipped without it.
 
 ## License
 
