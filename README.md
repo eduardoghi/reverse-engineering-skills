@@ -92,6 +92,15 @@ bpl-xref vmt app.exe TFORDEREDIT
 `--clean` only empties directories that java-decompile created or initialized while they were empty
 (they have a `.java-decompile-output` marker). It refuses any other non-empty folder.
 
+## Tests
+
+```sh
+python3 -m unittest discover -s tests
+```
+
+The tests build small PE files in code and run `bpl-xref` on them, so they need `pefile` but no real
+binaries. Without `pefile` they are skipped.
+
 ## License
 
 MIT, see `LICENSE`.
