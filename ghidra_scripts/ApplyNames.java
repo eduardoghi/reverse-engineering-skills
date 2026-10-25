@@ -1,7 +1,7 @@
 // Name functions from a file of "0xADDRESS Name" lines, such as the output of
 // `bpl-xref vmt --names`. A function that Ghidra doesn't have yet is created,
-// which matters for Delphi executables: handlers reached only through a
-// published method table are often missing after auto-analysis.
+// because in Delphi executables the handlers reached only through a published
+// method table are often missing after auto-analysis.
 //
 // analyzeHeadless PROJECT_DIR PROJECT -process PROGRAM -scriptPath ghidra_scripts \
 //     -preScript ApplyNames.java names.txt

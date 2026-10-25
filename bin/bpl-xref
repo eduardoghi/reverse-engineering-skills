@@ -111,6 +111,10 @@ class Image:
         return None if rva is None else self.base + rva
 
     def to_off(self, va):
+        # pefile hands back an RVA outside every section unchanged, a negative
+        # one included, and values read from the file can be anything.
+        if va < self.base:
+            return None
         try:
             return self.pe.get_offset_from_rva(va - self.base)
         except pefile.PEFormatError:
@@ -314,7 +318,10 @@ class Image:
         return slots
 
     def resources(self, type_id):
-        """Yield (entry, file offset, bytes) for each resource of a type, in every language."""
+        """Yield (entry, language, file offset, bytes) for each resource of a type, in every language.
+
+        Entries whose data lies outside the file are skipped.
+        """
         self.pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_RESOURCE"]])
         root = getattr(self.pe, "DIRECTORY_ENTRY_RESOURCE", None)
         for rtype in root.entries if root else []:
@@ -327,19 +334,22 @@ class Image:
                     if not hasattr(lang, "data"):
                         continue
                     d = lang.data.struct
-                    off = self.to_off(self.base + d.OffsetToData)
-                    yield entry, off, self.pe.get_data(d.OffsetToData, d.Size)
+                    try:
+                        body = self.pe.get_data(d.OffsetToData, d.Size)
+                    except pefile.PEFormatError:
+                        continue
+                    yield entry, lang.id, self.to_off(self.base + d.OffsetToData), body
 
     def form_resources(self):
         """Return (resource name, bytes) for each RCDATA resource holding a binary form."""
         forms = []
-        for entry, _off, body in self.resources(RT_RCDATA):
+        for entry, _lang, _off, body in self.resources(RT_RCDATA):
             if body.startswith(DFM_SIGNATURE):
                 forms.append((str(entry.name) if entry.name else str(entry.id), body))
         return forms
 
     def resource_strings(self):
-        """Map each string table ID to its text.
+        """Map each string table ID to its text in each language, {id: {language: text}}.
 
         A string table resource holds 16 strings, a 16-bit length in UTF-16
         units and the text without a terminator, and its ID times 16 minus 16
@@ -349,7 +359,7 @@ class Image:
         if self._strings is not None:
             return self._strings
         self._strings, self.string_ranges = {}, []
-        for entry, off, body in self.resources(RT_STRING):
+        for entry, lang, off, body in self.resources(RT_STRING):
             if entry.id is None:
                 continue
             if off is not None:
@@ -360,7 +370,8 @@ class Image:
                     break
                 n = struct.unpack_from("<H", body, p)[0]
                 if n:
-                    self._strings[(entry.id - 1) * 16 + i] = body[p + 2:p + 2 + 2 * n].decode("utf-16-le", "replace")
+                    text = body[p + 2:p + 2 + 2 * n].decode("utf-16-le", "replace")
+                    self._strings.setdefault((entry.id - 1) * 16 + i, {})[lang] = text
                 p += 2 + 2 * n
         return self._strings
 
@@ -521,7 +532,8 @@ class Image:
         tab = self._table(class_tab)
         if tab is not None:
             n = struct.unpack_from("<H", data, tab)[0]
-            for (cell,) in struct.iter_unpack("<I", data[tab + 2:tab + 2 + 4 * n]):
+            raw = data[tab + 2:tab + 2 + 4 * n]
+            for (cell,) in struct.iter_unpack("<I", raw[:len(raw) & ~3]):
                 types.append(self.class_name_in(cell))
         fields, p = [], off + 6
         for _ in range(count):
@@ -591,17 +603,20 @@ def print_resstrings(img, needle):
     Code passes the record to LoadResString (`mov eax, offset rec`), so the
     references go to the record, not to the text.
     """
-    matches = [(ident, text) for ident, text in sorted(img.resource_strings().items()) if needle in text]
+    strings = img.resource_strings()
+    matches = [(ident, lang, text) for ident, texts in sorted(strings.items())
+               for lang, text in sorted(texts.items()) if needle in text]
     if not matches:
         return False
     records = img.resstring_records()
-    wanted = {rec for ident, _ in matches for rec in records.get(ident, [])}
+    wanted = {rec for ident, _, _ in matches for rec in records.get(ident, [])}
     refs = collections.defaultdict(list)
     for va, target in img.pointers_to(wanted):
         refs[target].append(("ref" if img.in_code(va) else "ptr", va))
-    for ident, text in matches:
+    for ident, lang, text in matches:
         where = "" if text == needle else f" in {text!r}"
-        print(f"{needle!r} (resourcestring {ident}){where}")
+        language = f", language 0x{lang:04x}" if len(strings[ident]) > 1 else ""
+        print(f"{needle!r} (resourcestring {ident}{language}){where}")
         if ident not in records:
             print("    no resourcestring record, the string table may not come from Delphi code")
         for rec in records.get(ident, []):
@@ -757,9 +772,10 @@ def cmd_strings(img, args):
     for _va, text, size in img.literals():
         lines.append(f"{'ansi' if size == len(text) else 'unicode'}\t{text!r}")
     records = img.resstring_records()
-    for ident, text in img.resource_strings().items():
+    for ident, texts in img.resource_strings().items():
         names = sorted(name for rec in records.get(ident, []) if (name := img.export_name(rec)))
-        lines.append(f"resourcestring\t{' '.join(safe(n) for n in names) or '-'}\t{text!r}")
+        for text in texts.values():
+            lines.append(f"resourcestring\t{' '.join(safe(n) for n in names) or '-'}\t{text!r}")
     if lines:
         print("\n".join(sorted(lines)))
 
@@ -1110,14 +1126,19 @@ def cmd_vmt(img, args):
     if args.names:
         # One "address Class.Method" line per published method, the input of
         # ghidra_scripts/ApplyNames.java. Names Ghidra can't take are skipped.
-        lines = set()
+        wanted = {c.lower() for c in args.classes}
+        lines, matched = set(), False
         for vmt, cls in classes.items():
-            if args.classes and cls.lower() not in {c.lower() for c in args.classes}:
+            if wanted and cls.lower() not in wanted:
                 continue
+            matched = True
             for name, va in img.published_methods(vmt):
                 if re.fullmatch(r"[A-Za-z_]\w*", name, re.ASCII):
                     lines.add((va, f"{cls}.{name}"))
-        print("\n".join(f"0x{va:08x} {name}" for va, name in sorted(lines)))
+        if not matched:
+            sys.exit("bpl-xref: no class with that name (run without CLASS to list them)")
+        for va, name in sorted(lines):
+            print(f"0x{va:08x} {name}")
         return
     if not args.classes:
         for vmt, name in sorted(classes.items()):

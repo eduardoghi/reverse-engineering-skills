@@ -1,7 +1,7 @@
 """Tests for bin/bpl-xref against small 32-bit PE files built here.
 
-Each fixture is a Delphi-like image assembled byte by byte: code with string and
-record references, an import thunk, AnsiString literals, VMTs with published
+Each fixture is a Delphi-like image assembled byte by byte, with code holding string
+and record references, an import thunk, AnsiString literals, VMTs with published
 methods and fields, form and string table resources, exports and a relocation
 table. Run with `python3 -m unittest discover -s tests`. Needs pefile.
 """
@@ -13,7 +13,7 @@ import tempfile
 import unittest
 
 try:
-    import pefile  # noqa: F401  (bpl-xref needs it, the fixtures don't)
+    import pefile
 except ImportError:
     raise unittest.SkipTest("bpl-xref needs the pefile module")
 
@@ -193,11 +193,15 @@ def string_block(texts):
 
 
 def resources(tree):
-    """Build a .rsrc section for {type id: {name or id: bytes}}, one language each."""
+    """Build a .rsrc section for {type id: {name or id: bytes or {language: bytes}}}.
+
+    Plain bytes get language 0x416.
+    """
     def ordered(entries):
         named = sorted((k for k in entries if isinstance(k, str)), key=str.upper)
         return named + sorted(k for k in entries if isinstance(k, int))
 
+    tree = {t: {k: v if isinstance(v, dict) else {0x416: v} for k, v in entries.items()} for t, entries in tree.items()}
     types = sorted(tree)
     off = 16 + 8 * len(types)
     type_off, lang_off, entry_off, name_off, blob_off = {}, {}, {}, {}, {}
@@ -205,20 +209,21 @@ def resources(tree):
         type_off[t] = off
         off += 16 + 8 * len(tree[t])
     keys = [(t, k) for t in types for k in ordered(tree[t])]
-    for key in keys:
-        lang_off[key] = off
-        off += 24
-    for key in keys:
-        entry_off[key] = off
+    blobs = [(t, k, lang) for t, k in keys for lang in sorted(tree[t][k])]
+    for t, k in keys:
+        lang_off[(t, k)] = off
+        off += 16 + 8 * len(tree[t][k])
+    for blob in blobs:
+        entry_off[blob] = off
         off += 16
     for t, k in keys:
         if isinstance(k, str):
             name_off[(t, k)] = off
             off += 2 + 2 * len(k)
     off += -off % 4
-    for t, k in keys:
-        blob_off[(t, k)] = off
-        off += len(tree[t][k]) + (-len(tree[t][k]) % 4)
+    for t, k, lang in blobs:
+        blob_off[(t, k, lang)] = off
+        off += len(tree[t][k][lang]) + (-len(tree[t][k][lang]) % 4)
 
     out = bytearray(off)
 
@@ -234,10 +239,11 @@ def resources(tree):
         directory(type_off[t], [((0x80000000 | name_off[(t, k)]) if isinstance(k, str) else k,
                                  0x80000000 | lang_off[(t, k)]) for k in ordered(tree[t])])
     for t, k in keys:
-        directory(lang_off[(t, k)], [(0x416, entry_off[(t, k)])])
-        blob = tree[t][k]
-        struct.pack_into("<IIII", out, entry_off[(t, k)], RSRC_RVA + blob_off[(t, k)], len(blob), 0, 0)
-        out[blob_off[(t, k)]:blob_off[(t, k)] + len(blob)] = blob
+        directory(lang_off[(t, k)], [(lang, entry_off[(t, k, lang)]) for lang in sorted(tree[t][k])])
+        for lang, blob in tree[t][k].items():
+            at = (t, k, lang)
+            struct.pack_into("<IIII", out, entry_off[at], RSRC_RVA + blob_off[at], len(blob), 0, 0)
+            out[blob_off[at]:blob_off[at] + len(blob)] = blob
         if isinstance(k, str):
             raw = struct.pack("<H", len(k)) + k.encode("utf-16-le")
             out[name_off[(t, k)]:name_off[(t, k)] + len(raw)] = raw
@@ -292,8 +298,12 @@ def write_pe(path, sections, dirs, dll):
             fh.write(body + b"\0" * (raw_size - len(body)))
 
 
-def build(path, with_exports, with_relocs, slot_count=19):
-    """Write a fixture and return the addresses the tests check."""
+def build(path, with_exports, with_relocs, slot_count=19, helper_parent=0, strings=None):
+    """Write a fixture and return the addresses the tests check.
+
+    helper_parent goes into THelper's vmtParent slot, and strings, when
+    given, replaces the string table block as {language: bytes}.
+    """
     data = Section(DATA_RVA)
     module_var = data.u32(0)
     literal = ansi_literal(data, LITERAL.encode("cp1252"))
@@ -308,7 +318,7 @@ def build(path, with_exports, with_relocs, slot_count=19):
     import_dir = imports(data, "vcl70.bpl", ["@Forms@TForm@", "@Stdctrls@TButton@",
                                              "@Dialogs@ShowMessage$qqrx17System@AnsiString"])
     slots = import_dir[2]
-    helper, helper_cell = vmt(data, "THelper", slot_count=slot_count)
+    helper, helper_cell = vmt(data, "THelper", helper_parent, slot_count=slot_count)
     base, base_cell = vmt(data, "TFBaseEdit", slots["@Forms@TForm@"], methods=[("FormShow", VA_SHOW)],
                           slot_count=slot_count)
     edit, _ = vmt(data, "TFOrderEdit", base_cell,
@@ -354,7 +364,7 @@ def build(path, with_exports, with_relocs, slot_count=19):
     ])
     ghost = b"TPF0" + dfm_object("TFGhost", "FGhost", [dfm_ident("OnClick", "GhostClick")])
     rsrc = resources({
-        RT_STRING: {4096: string_block(["Invalid order %s", "Order saved"])},
+        RT_STRING: {4096: strings or string_block(["Invalid order %s", "Order saved"])},
         RT_RCDATA: {"TFORDEREDIT": form, "TFGHOST": ghost},
     })
     dirs[2] = (RSRC_RVA, len(rsrc))
@@ -369,6 +379,16 @@ def build(path, with_exports, with_relocs, slot_count=19):
     write_pe(path, sections, dirs, dll=with_exports)
     return {"literal": literal, "record": record, "unused_record": unused_record,
             "helper": helper, "base": base, "edit": edit}
+
+
+def patch(path, edit):
+    """Change a built file in place. edit(pe, data) gets the parsed file and a bytearray of it."""
+    pe = pefile.PE(path)
+    data = bytearray(pe.__data__)
+    edit(pe, data)
+    pe.close()
+    with open(path, "wb") as fh:
+        fh.write(data)
 
 
 def run(*args):
@@ -391,6 +411,11 @@ class Fixtures(unittest.TestCase):
         build(cls.exe, with_exports=False, with_relocs=True)
         build(cls.bare, with_exports=False, with_relocs=False)
         cls.at_unicode = build(cls.unicode, with_exports=False, with_relocs=True, slot_count=22)
+        cls.translated = os.path.join(cls.tmp.name, "translated.exe")
+        cls.at_translated = build(cls.translated, with_exports=False, with_relocs=True, strings={
+            0x409: string_block(["Invalid order %s", "Order saved"]),
+            0x416: string_block(["Pedido inválido %s", "Pedido salvo"]),
+        })
 
     @classmethod
     def tearDownClass(cls):
@@ -433,6 +458,13 @@ class StrTest(Fixtures):
         self.assertIn(f"    record 0x{self.at['record']:08x}", out)
         self.assertIn(f"    ref 0x{REF_RECORD:08x}", out)
 
+    def test_resourcestring_in_each_language(self):
+        for text, lang in (("Order saved", 0x409), ("Pedido salvo", 0x416)):
+            with self.subTest(lang=lang):
+                out = self.ok("str", self.translated, text)
+                self.assertIn(f"{text!r} (resourcestring {FIRST_STRING_ID + 1}, language 0x{lang:04x})\n"
+                              f"    record 0x{self.at_translated['unused_record']:08x}", out)
+
     def test_no_match(self):
         code, _, err = run("str", self.bpl, "Nothing like this")
         self.assertEqual(code, 1)
@@ -462,6 +494,15 @@ class StringsTest(Fixtures):
         lines = self.ok("strings", self.exe).splitlines()
         self.assertIn("resourcestring\t-\t'Invalid order %s'", lines)
         self.assertIn(f"ansi\t{LITERAL!r}", lines)
+
+    def test_every_language(self):
+        lines = self.ok("strings", self.translated).splitlines()
+        self.assertEqual([line for line in lines if line.startswith("resourcestring")], [
+            "resourcestring\t-\t'Invalid order %s'",
+            "resourcestring\t-\t'Order saved'",
+            "resourcestring\t-\t'Pedido inválido %s'",
+            "resourcestring\t-\t'Pedido salvo'",
+        ])
 
 
 class DfmTest(Fixtures):
@@ -546,9 +587,55 @@ class VmtTest(Fixtures):
         self.assertEqual(self.ok("vmt", "--names", self.unicode, "tfbaseedit"), f"0x{VA_SHOW:08x} TFBaseEdit.FormShow\n")
 
     def test_unknown_class(self):
-        code, _, err = run("vmt", self.exe, "TNope")
-        self.assertEqual(code, 1)
-        self.assertIn("no class with that name", err)
+        for args in (("vmt", self.exe, "TNope"), ("vmt", "--names", self.exe, "TNope")):
+            with self.subTest(args=args[:-2]):
+                code, out, err = run(*args)
+                self.assertEqual(code, 1)
+                self.assertEqual(out, "")
+                self.assertIn("no class with that name", err)
+
+
+class MalformedTest(Fixtures):
+    """Tables that point outside the file or at the wrong place are skipped, not a crash."""
+
+    def copy(self, name, source):
+        path = os.path.join(self.tmp.name, name)
+        with open(source, "rb") as src, open(path, "wb") as dst:
+            dst.write(src.read())
+        return path
+
+    def test_string_table_outside_the_file(self):
+        def edit(pe, data):
+            for rtype in pe.DIRECTORY_ENTRY_RESOURCE.entries:
+                if rtype.id == RT_STRING:
+                    for entry in rtype.directory.entries:
+                        for lang in entry.directory.entries:
+                            struct.pack_into("<I", data, lang.data.struct.get_file_offset(), 0x7FFFFFF0)
+
+        path = self.copy("badtable.bpl", self.bpl)
+        patch(path, edit)
+        self.assertIn(f"ansi\t{LITERAL!r}", self.ok("strings", path))
+        self.assertIn("(utf-16-le) at", self.ok("str", path, "Order saved"))
+        self.assertIn("TFORDEREDIT", self.ok("dfm", path))
+
+    def test_field_class_table_cut_by_the_end_of_the_file(self):
+        def edit(pe, data):
+            # vmtFieldTable is 0x38 bytes before the VMT. The field table starts
+            # with the field count and then the pointer to the class table.
+            field_table = struct.unpack_from("<I", data, pe.get_offset_from_rva(self.at["edit"] - 0x38 - IMAGE_BASE))[0]
+            end = len(data) - 4
+            struct.pack_into("<I", data, pe.get_offset_from_rva(field_table - IMAGE_BASE) + 2,
+                             IMAGE_BASE + pe.get_rva_from_offset(end))
+            struct.pack_into("<H", data, end, 3)
+
+        path = self.copy("fieldtable.exe", self.exe)
+        patch(path, edit)
+        self.assertIn("    +0x3a4 BtnSave: ?\n    +0x3a8 Helper: ?", self.ok("vmt", path, "TFOrderEdit"))
+
+    def test_parent_pointer_below_the_image_base(self):
+        path = os.path.join(self.tmp.name, "lowparent.exe")
+        at = build(path, with_exports=False, with_relocs=False, helper_parent=0x10)
+        self.assertIn(f"0x{at['helper']:08x} THelper < -  0 methods  0 fields", self.ok("vmt", path))
 
 
 if __name__ == "__main__":
