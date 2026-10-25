@@ -16,6 +16,8 @@ Skills and helper scripts for Claude Code reverse-engineering work. New skills g
   a network share and the font engine cost, and capture a silent crash.
 - `skills/unreal-engine`: go from what a player sees in an Unreal Engine 4 game to the map or blueprint
   behind it, export it with CUE4Parse and read its bytecode with `kismet-trace`.
+- `skills/dotnet-decompile`: decompile .NET assemblies to C# and XAML with ilspycmd, list the native
+  functions they call and read the configuration and Entity Framework model of the program.
 
 ## Scripts
 
@@ -57,6 +59,7 @@ ln -sfn "$PWD/skills/binary-diff" ~/.claude/skills/binary-diff
 ln -sfn "$PWD/skills/binary-patch" ~/.claude/skills/binary-patch
 ln -sfn "$PWD/skills/wine-debugging" ~/.claude/skills/wine-debugging
 ln -sfn "$PWD/skills/unreal-engine" ~/.claude/skills/unreal-engine
+ln -sfn "$PWD/skills/dotnet-decompile" ~/.claude/skills/dotnet-decompile
 java-decompile --check
 bpl-xref --help > /dev/null && echo 'bpl-xref ok'   # fails if pefile is missing
 ```
@@ -79,6 +82,12 @@ Requirements for `unreal-engine`:
 - The .NET 10 SDK to build CUE4Parse and the small exporter the skill shows
 - `kismet-trace`, below, and `ue-locres` and `ue-save`, which need only Python 3. `ue-save` needs the
   Oodle library the exporter downloads for Oodle-compressed saves
+
+Requirements for `dotnet-decompile`:
+
+- The .NET SDK and `ilspycmd` (`dotnet tool install -g ilspycmd`), tried with version 11.1 on .NET 10
+- The .NET Framework reference assemblies from NuGet, for .NET Framework programs (see the skill)
+- `jq` to list the native calls, and Python 3 with `pefile` to sort an install folder
 
 Requirements for `kismet-trace`:
 
