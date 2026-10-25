@@ -4,6 +4,7 @@
   bpl-xref str FILE STRING...         code that references a string literal
   bpl-xref calls FILE ADDR|EXPORT...  calls, jumps and pointers to an address
   bpl-xref flags FILE [START END]     rizin flags for import thunks and literals
+  bpl-xref strings FILE               every literal and resourcestring, sorted for diff
   bpl-xref dfm FILE [FORM...]         list form resources or print them as text
   bpl-xref vmt FILE [CLASS...]        list classes or print published methods and fields
 
@@ -36,6 +37,10 @@ MAX_LITERAL = 1 << 16
 RT_STRING = 6
 RT_RCDATA = 10
 DFM_SIGNATURE = b"TPF0"
+# Position and size properties, which change whenever a form is touched in the
+# designer and hide the changes that matter in a diff between builds.
+DFM_GEOMETRY = {"Left", "Top", "Width", "Height", "ClientWidth", "ClientHeight", "ExplicitLeft",
+                "ExplicitTop", "ExplicitWidth", "ExplicitHeight", "DesignSize"}
 MAX_CANDIDATES = 10
 # VMT slots of Delphi 2 to 2007, as offsets from the class pointer. Delphi
 # 2009 added three virtual methods in front of them and moved every slot.
@@ -242,6 +247,25 @@ class Image:
         if not all(c.isprintable() or c in "\t\r\n" for c in text):
             return None
         return text, size
+
+    def literals(self):
+        """Yield (va, text, size) for each string literal the file points at.
+
+        With a relocation table the candidates are the relocated pointers,
+        otherwise every -1 reference count in code.
+        """
+        if self.relocs is not None:
+            targets = {self.read_u32(self.base + rva) for rva in self.relocs}
+        else:
+            targets = set()
+            for start, size, va0 in self.code_ranges():
+                for m in re.finditer(rb"\xff\xff\xff\xff", self.data[start:start + size]):
+                    targets.add(va0 + m.end() + 4)
+        targets.discard(None)
+        for va in sorted(targets):
+            lit = self.literal_at(va)
+            if lit:
+                yield va, *lit
 
     def c_string(self, va, limit=1024):
         off = self.to_off(va)
@@ -694,10 +718,8 @@ def cmd_flags(img, args):
         emit(flag_name("thunk.", name, 96), 6, va)
         thunks += 1
 
-    lo = int(args.start, 16) if args.start else None
-    hi = int(args.end, 16) if args.end else None
-    targets = set()
-    if lo is not None:
+    if args.start:
+        lo, hi = int(args.start, 16), int(args.end, 16)
         if img.relocs is not None:
             targets = {img.read_u32(img.base + rva) for rva in img.relocs if lo <= img.base + rva < hi}
         else:
@@ -706,22 +728,33 @@ def cmd_flags(img, args):
                 sys.exit(f"bpl-xref: 0x{lo:08x} is not inside the file")
             chunk = img.data[off:off + (hi - lo) + 3]
             targets = {struct.unpack_from("<I", chunk, i)[0] for i in range(len(chunk) - 3)}
-    elif img.relocs is not None:
-        targets = {img.read_u32(img.base + rva) for rva in img.relocs}
+        targets.discard(None)
+        literals = ((va, *lit) for va in sorted(targets) if (lit := img.literal_at(va)))
     else:
-        for start, size, va0 in img.code_ranges():
-            for m in re.finditer(rb"\xff\xff\xff\xff", img.data[start:start + size]):
-                targets.add(va0 + m.end() + 4)
+        literals = img.literals()
 
     strings = 0
-    targets.discard(None)
-    for va in sorted(targets):
-        lit = img.literal_at(va)
-        if lit:
-            text, size = lit
-            emit(flag_name("str.", text, 48), size, va)
-            strings += 1
+    for va, text, size in literals:
+        emit(flag_name("str.", text, 48), size, va)
+        strings += 1
     print(f"bpl-xref: {thunks} import thunks, {strings} string literals", file=sys.stderr)
+
+
+def cmd_strings(img, args):
+    """Print every literal and resourcestring as one sorted line, for diffing two builds.
+
+    Addresses and string IDs are left out because they move between builds.
+    A resourcestring keeps the name of its exported record when there is one.
+    """
+    lines = []
+    for _va, text, size in img.literals():
+        lines.append(f"{'ansi' if size == len(text) else 'unicode'}\t{text!r}")
+    records = img.resstring_records()
+    for ident, text in img.resource_strings().items():
+        names = sorted(name for rec in records.get(ident, []) if (name := img.export_name(rec)))
+        lines.append(f"resourcestring\t{' '.join(safe(n) for n in names) or '-'}\t{text!r}")
+    if lines:
+        print("\n".join(sorted(lines)))
 
 
 class DfmError(Exception):
@@ -925,6 +958,21 @@ def dfm_text(obj, indent=0):
     return lines
 
 
+def dfm_without(obj, names):
+    """Copy of an object tree without the named properties, in collection items too."""
+    def props(items):
+        kept = []
+        for name, (kind, value) in items:
+            if name in names:
+                continue
+            if kind == "collection":
+                value = [(index, props(item)) for index, item in value]
+            kept.append((name, (kind, value)))
+        return kept
+
+    return dict(obj, props=props(obj["props"]), children=[dfm_without(c, names) for c in obj["children"]])
+
+
 def dfm_events(obj, owner=None):
     """Yield (owner class, component, event, handler) for each event property.
 
@@ -977,7 +1025,7 @@ def cmd_dfm(img, args):
                     if f[0].lower() in wanted or (f[2] and {f[2]["class"].lower(), f[2]["name"].lower()} & wanted)]
         if not selected:
             sys.exit("bpl-xref: no form with that resource, class or object name (run without FORM to list them)")
-    elif args.events:
+    elif args.events or args.all:
         selected = forms
     else:
         for res, size, obj, err in forms:
@@ -994,7 +1042,7 @@ def cmd_dfm(img, args):
             print(f"{safe(res)}: unreadable: {err}")
             continue
         if not args.events:
-            print("\n".join(dfm_text(obj)))
+            print("\n".join(dfm_text(dfm_without(obj, DFM_GEOMETRY) if args.no_geometry else obj)))
             continue
         for owner, comp, event, handler in dfm_events(obj):
             exact = by_class.get((owner.lower(), handler.lower()))
@@ -1115,6 +1163,15 @@ def main():
     p.add_argument("end", nargs="?", help="end of the code range (hex, exclusive)")
     p.set_defaults(func=cmd_flags)
 
+    p = sub.add_parser("strings", help="print every literal and resourcestring, sorted for diff",
+                       description="Print each string literal the code points at (the ones `flags` "
+                                   "names) and each string table entry, one per line and sorted, "
+                                   "without addresses or string IDs, so the output of two builds "
+                                   "can be compared with diff. A resourcestring line has the name "
+                                   "of its exported record, or - when it has none.")
+    p.add_argument("file")
+    p.set_defaults(func=cmd_strings)
+
     p = sub.add_parser("dfm", help="list form resources or print them as text",
                        description="Read binary form resources (RCDATA that starts with TPF0). "
                                    "Without FORM, list every form with its class and number of event "
@@ -1127,6 +1184,9 @@ def main():
     p.add_argument("file")
     p.add_argument("forms", nargs="*", metavar="form", help="resource, class or object name (any case)")
     p.add_argument("--events", action="store_true", help="print event handlers and their methods")
+    p.add_argument("--all", action="store_true", help="print every form as text")
+    p.add_argument("--no-geometry", action="store_true",
+                   help="leave out position and size properties (Left, Top, Width, Height and similar)")
     p.set_defaults(func=cmd_dfm)
 
     p = sub.add_parser("vmt", help="list classes or print their published methods and fields",

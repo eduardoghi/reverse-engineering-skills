@@ -175,6 +175,15 @@ def dfm_ident(name, ident):
     return short_string(name) + b"\x07" + short_string(ident)
 
 
+def dfm_int(name, value):
+    return short_string(name) + b"\x03" + struct.pack("<h", value)
+
+
+def dfm_collection(name, items):
+    """A collection property whose items are lists of properties."""
+    return short_string(name) + b"\x0e" + b"".join(b"\x01" + b"".join(i) + b"\0" for i in items) + b"\0"
+
+
 def string_block(texts):
     """One string table resource, 16 length-prefixed UTF-16 strings with the unused ones empty."""
     texts = list(texts) + [""] * (16 - len(texts))
@@ -330,11 +339,14 @@ def build(path, with_exports, with_relocs):
     text.ptr(slots["@Dialogs@ShowMessage$qqrx17System@AnsiString"])
 
     form = b"TPF0" + dfm_object("TFOrderEdit", "FOrderEdit", [
+        dfm_int("Left", 8),
+        dfm_int("Width", 320),
         dfm_string("Caption", CAPTION),
         dfm_ident("OnShow", "FormShow"),
         dfm_ident("OnClose", "FormClose"),
+        dfm_collection("Columns", [[dfm_string("Title", "Customer"), dfm_int("Width", 50)]]),
     ], [
-        dfm_object("TButton", "BtnSave", [dfm_ident("OnClick", "BtnSaveClick")]),
+        dfm_object("TButton", "BtnSave", [dfm_int("Top", 200), dfm_ident("OnClick", "BtnSaveClick")]),
         dfm_object("TButton", "BtnCancel", [dfm_ident("OnClick", "BtnCancelClick")]),
     ])
     ghost = b"TPF0" + dfm_object("TFGhost", "FGhost", [dfm_ident("OnClick", "GhostClick")])
@@ -432,6 +444,21 @@ class FlagsTest(Fixtures):
         self.assertNotIn("str.a_b", self.ok("flags", self.bpl))
 
 
+class StringsTest(Fixtures):
+    def test_literals_and_resourcestrings_sorted(self):
+        lines = self.ok("strings", self.bpl).splitlines()
+        self.assertEqual(lines, [
+            f"ansi\t{LITERAL!r}",
+            "resourcestring\t-\t'Order saved'",
+            "resourcestring\t@Uorders@SInvalidOrder\t'Invalid order %s'",
+        ])
+
+    def test_records_without_exports(self):
+        lines = self.ok("strings", self.exe).splitlines()
+        self.assertIn("resourcestring\t-\t'Invalid order %s'", lines)
+        self.assertIn(f"ansi\t{LITERAL!r}", lines)
+
+
 class DfmTest(Fixtures):
     def test_list(self):
         out = self.ok("dfm", self.bpl)
@@ -443,6 +470,20 @@ class DfmTest(Fixtures):
         self.assertIn("object FOrderEdit: TFOrderEdit", out)
         self.assertIn(f"  Caption = '{CAPTION}'", out)
         self.assertIn("  object BtnSave: TButton", out)
+
+    def test_all_forms_as_text(self):
+        out = self.ok("dfm", "--all", self.bpl)
+        self.assertIn("object FOrderEdit: TFOrderEdit\n  Left = 8\n  Width = 320\n", out)
+        self.assertIn("      Width = 50\n", out)
+        self.assertIn("object FGhost: TFGhost", out)
+
+    def test_no_geometry(self):
+        out = self.ok("dfm", "--all", "--no-geometry", self.bpl)
+        for prop in ("Left =", "Top =", "Width ="):
+            self.assertNotIn(prop, out)
+        self.assertIn(f"  Caption = '{CAPTION}'", out)
+        self.assertIn("      Title = 'Customer'", out)
+        self.assertIn("    OnClick = BtnSaveClick", out)
 
     def test_events_in_a_package(self):
         out = self.ok("dfm", "--events", self.bpl)

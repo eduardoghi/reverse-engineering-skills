@@ -22,8 +22,10 @@ Skills and helper scripts for Claude Code reverse-engineering work. New skills g
 - `bin/bpl-xref`: cross-references for 32-bit PE files, used by the `delphi-bpl` skill. Finds the code
   that uses a string literal or a resourcestring (`str`), the calls and pointers to an address
   (`calls`), prints rizin flags that name import thunks and string literals in the disassembly
-  (`flags`), reads the form resources to map each event to its method (`dfm`) and lists the published
-  methods and fields of each class from its VMT, which also works on EXEs without exports (`vmt`).
+  (`flags`), lists every literal and resourcestring in a form `diff` can compare between builds
+  (`strings`), reads the form resources to map each event to its method (`dfm`) and lists the
+  published methods and fields of each class from its VMT, which also works on EXEs without exports
+  (`vmt`).
 
 ## Setup
 
@@ -86,6 +88,8 @@ bpl-xref calls app.bpl 0x0045a1c0
 bpl-xref flags app.bpl 0x0045a1c0 0x0045b000 > flags.rz
 bpl-xref dfm app.bpl TFORDEREDIT
 bpl-xref dfm --events app.bpl
+bpl-xref dfm --all --no-geometry app.bpl > app.dfm
+bpl-xref strings app.bpl > app.txt
 bpl-xref vmt app.exe TFORDEREDIT
 ```
 
