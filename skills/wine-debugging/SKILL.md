@@ -101,7 +101,37 @@ magick shot.png -crop 900x60+0+500 part.png      # zoom into a region before rea
   screen shows the loaded data.
 - A grid can keep showing an edited value after it was saved or reverted. Check the result in the data
   the program writes (a database, a file) rather than on the screen, and reload the record before
-  editing it again.
+  editing it again. Some screens only write when a save button is pressed, not when the field loses
+  focus, and a child dialog's "OK" may only take effect after the save button of the parent screen.
+- Clicking a VCL edit box doesn't select its text, and `ctrl+a` doesn't select all in it, so typing
+  appends to the old value. A record number field kept its digits and the new ones went after them,
+  and the program asked whether to create a record out of sequence. Clear the field with `End` and
+  enough `BackSpace`, or reach it with `Tab`, which selects the whole text of the field it lands on.
+- A click can land on the neighbouring field and take the typing with it, for example a code that
+  ended up inside a date field and came back as an invalid date. After clicking a field, capture it and
+  check the focus before typing.
+- A form with a horizontal scroll bar scrolls when a field near its edge gets the focus, so every
+  coordinate read from the previous capture moves. Capture again after each click on such a form.
+- In a data grid (`TDBGrid`), `Down` on the last row usually posts it and appends a new row (once it
+  appended nothing, and the row came only with `Insert`), and `Escape` discards an appended row that is
+  still empty. `Insert`, or a click on a cell of the empty row, makes the grid validate that row at once
+  and pops up a "required field" message. To reach a column, press `Tab` a counted number of times from
+  a column you know instead of clicking, because the grid scrolls sideways as the focus moves.
+- Message boxes often share one title ("Confirmation", "Warning") and a progress window can stay open
+  under them. Tell them apart by size with `xdotool getwindowgeometry` and wait in a loop for the next
+  window that isn't the progress one:
+
+  ```sh
+  for i in $(seq 1 30); do sleep 2
+    for d in $(wmctrl -l | awk 'NR>2{print $1}'); do        # skip the main windows
+      g=$(xdotool getwindowgeometry $d | grep Geometry)
+      case "$g" in *260x92*) ;;                             # size of the progress window
+        *) import -window $d next.png; echo "$d $g"; break 2;; esac
+    done
+  done
+  ```
+
+  Click the buttons by coordinates inside the dialog (`mousemove --window $d`), read from its capture.
 
 ## Text widths that differ from Windows
 
