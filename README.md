@@ -1,5 +1,7 @@
 # reverse-engineering-skills
 
+[![XERJ Corpus Hub contributor](https://hub.xerj.org/contributors/eduardoghi/badge.svg)](https://hub.xerj.org/contributors/eduardoghi)
+
 Skills and helper scripts for Claude Code reverse-engineering work. New skills get added as they're needed.
 
 ## Skills
