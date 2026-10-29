@@ -22,18 +22,46 @@ for p in /proc/[0-9]*; do tr '\0' ' ' < $p/cmdline 2>/dev/null | grep -q '^C:.Di
 
 - `perf record -e cpu-clock:u -F 499 -g -p PID -- sleep 120` counts CPU time only, and it works on the
   process of your own user without extra permission. A program that waits for files or the network
-  shows a few seconds of CPU while the user waits a minute.
+  shows a few seconds of CPU while the user waits a minute. With `kernel.perf_event_paranoid` at 2 on a
+  hybrid Intel CPU, `-e cpu-clock:u` and `-g` failed to open, while the default event and
+  `--call-graph=dwarf,8192 --user-callchains` worked.
 - `strace -f -c -w -p PID -o resumo.txt` totals the wall time spent in each system call, for all threads.
   Idle threads (a timer thread in `pselect6`, a waiting thread in `ioctl` or `futex`) dominate the
   totals, so look at what the busy thread does. Stop it with Ctrl+C or `kill -INT` so it prints.
 - To see the main thread over time without attaching anything, read `/proc/PID/task/PID/stat`
   (field 3 is the state, `R` running, `S` sleeping, `D` waiting on I/O) and `/proc/PID/task/PID/syscall`
   every 20 ms. A thread blocked in `read`, `getxattr` or `newfstatat` in state `D` is waiting for files.
-  Group the samples by 10 seconds to see when the slow part starts and ends. Reading these files needs
-  ptrace permission (see `kernel.yama.ptrace_scope` in the `delphi-bpl` skill).
+  Group the samples by 10 seconds to see when the slow part starts and ends. Reading `syscall` needs
+  ptrace permission (see `kernel.yama.ptrace_scope` in the `delphi-bpl` skill). `stat`, `wchan` and
+  `/proc/PID/io` don't, so without it sample the state, the `wchan` of each thread and the `rchar` and
+  `syscr` counters of the process. A main thread in `ntsync_schedule` with flat counters is waiting on a
+  Windows object, which for a program with a message loop usually means it is idle, so check this
+  before profiling a screen the user calls slow.
 - Many sockets show up as `sendmsg` and `recvmsg` to the wine server. Count the ones on the database
   socket and the gap between a send and the next read to get the round trip time. In one case 1281
   round trips cost 0.7 seconds in total, which cleared the database of any blame.
+
+## Stacks of 32-bit code
+
+With the new wow64 mode of Wine a 32-bit program runs inside a 64-bit Linux process, and `perf` doesn't
+know its code. The PE images appear as `[JIT] tid PID` (backed by `/tmp/perf-PID.map`) or as Wine DLLs
+without symbols, and `--call-graph=fp` unwinds the 32-bit frames as 64-bit ones, which gives garbage
+addresses. The dwarf mode still copies the raw user stack of every sample, and `bin/pe-stacks` reads it:
+
+```sh
+perf record --call-graph=dwarf,8192 --user-callchains -F 299 -p PID -o perf.data -- sleep 90
+cp /proc/PID/maps maps.txt                       # the bases of the images, while the program runs
+pe-stacks --maps maps.txt perf.data                          # whole recording
+pe-stacks --maps maps.txt --from 5012.3 --to 5017 perf.data   # perf timestamps, in seconds
+pe-stacks --maps maps.txt --module app.dll --depth 1 perf.data
+```
+
+Pick the busy window for `--from` and `--to` from the samples per second it prints. `--module` starts
+each path at the innermost frame of one image, which shows the function of the program that spends the
+time when most of the CPU is in the runtime library. A private function shows as the export before it
+plus an offset, so read it with `bpl-xref` or rizin. The scan also picks up stale return addresses left
+by calls that already returned. The real chain repeats in hundreds of samples, so read the counts and
+not one sample.
 
 ## Files on a network share
 

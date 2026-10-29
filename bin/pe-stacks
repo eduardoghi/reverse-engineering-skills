@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Call stacks of 32-bit Windows code from a perf recording of a Wine process.
+
+  perf record --call-graph=dwarf,8192 --user-callchains -F 299 -p PID -o perf.data -- sleep 60
+  pe-stacks perf.data PID                     functions and the innermost frames of each sample
+  pe-stacks --maps maps.txt perf.data         same, with /proc/PID/maps saved while it ran
+
+Under the new wow64 mode of Wine a 32-bit program runs inside a 64-bit
+process. perf unwinds its frames as 64-bit ones, so --call-graph=fp gives
+garbage and the PE images show up as [JIT] or as DLLs without symbols. The
+dwarf mode still copies the raw user stack of every sample. This tool reads
+that copy, takes every 32-bit word that points into an executable section of
+a PE image and follows a call instruction, and treats it as a return address.
+The words closer to the stack pointer are the deeper frames.
+
+A stack scan finds stale return addresses too, left by calls that already
+returned. They repeat less than the real chain, so read the counts, not a
+single sample. Names come from the export table, so a nested or private
+function shows as the export before it plus an offset.
+"""
+import argparse
+import bisect
+import collections
+import os
+import re
+import struct
+import subprocess
+import sys
+
+try:
+    import pefile
+except ImportError:
+    sys.exit("pe-stacks: needs the pefile module (pacman -S python-pefile or pip install pefile)")
+
+IMAGE_SCN_MEM_EXECUTE = 0x20000000
+PE_SUFFIXES = (".dll", ".exe", ".bpl", ".ocx", ".drv")
+
+
+class Image:
+    def __init__(self, path, base):
+        self.path = path
+        self.name = os.path.basename(path)
+        self.base = base
+        # Delphi packages export tens of thousands of names, past the pefile default of 8192.
+        self.pe = pefile.PE(path, fast_load=True, max_symbol_exports=1 << 20)
+        self.pe.parse_data_directories([pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_EXPORT"]])
+        self.code = [(base + s.VirtualAddress, base + s.VirtualAddress + s.Misc_VirtualSize)
+                     for s in self.pe.sections if s.Characteristics & IMAGE_SCN_MEM_EXECUTE]
+        exports = getattr(self.pe, "DIRECTORY_ENTRY_EXPORT", None)
+        named = {}
+        for e in (exports.symbols if exports else []):
+            if e.address and (e.name or base + e.address not in named):
+                named[base + e.address] = (e.name or b"#%d" % e.ordinal).decode("latin1")
+        self.exports = sorted(named.items())
+        self.addrs = [a for a, _ in self.exports]
+
+    def follows_call(self, addr):
+        try:
+            before = self.pe.get_data(addr - self.base - 7, 7)
+        except Exception:
+            return False
+        # call rel32 (E8), call r/m32 (FF /2) with 2, 3, 6 or 7 byte encodings
+        return before[2] == 0xE8 or 0xFF in (before[0], before[1], before[4], before[5])
+
+    def symbol(self, addr):
+        i = bisect.bisect_right(self.addrs, addr) - 1
+        if i < 0:
+            return "%s+%x" % (self.name, addr - self.base)
+        return "%s+%x" % (self.exports[i][1], addr - self.exports[i][0])
+
+
+def load_images(maps_lines):
+    images = {}
+    for line in maps_lines:
+        parts = line.split(None, 5)
+        if len(parts) < 6 or int(parts[2], 16) != 0:
+            continue
+        path = parts[5].strip()
+        if not path.lower().endswith(PE_SUFFIXES) or path in images:
+            continue
+        try:
+            images[path] = Image(path, int(parts[0].split("-")[0], 16))
+        except (OSError, pefile.PEFormatError):
+            pass
+    ranges = sorted((lo, hi, img) for img in images.values() for lo, hi in img.code)
+    return ranges
+
+
+def find(ranges, starts, addr):
+    i = bisect.bisect_right(starts, addr) - 1
+    if i >= 0 and addr < ranges[i][1]:
+        return ranges[i][2]
+    return None
+
+
+def samples(perf_data):
+    """Yields (time, ip, raw stack bytes) for every sample, from perf script -D."""
+    proc = subprocess.Popen(["perf", "script", "-D", "-i", perf_data], stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True, errors="replace")
+    raw = bytearray()
+    current = None
+    hexline = re.compile(r"^\.\s+[0-9a-f]{4}:\s+((?:[0-9a-f]{2} )+)")
+    sample = re.compile(r"^(\d+) 0x[0-9a-f]+ \[0x[0-9a-f]+\]: PERF_RECORD_SAMPLE.*?: (0x[0-9a-f]+) period")
+    ustack = re.compile(r"^\.\.\. ustack: size (\d+), offset (0x[0-9a-f]+)")
+    for line in proc.stdout:
+        m = hexline.match(line)
+        if m:
+            raw += bytes.fromhex(m.group(1).replace(" ", ""))
+            continue
+        m = sample.match(line)
+        if m:
+            current = (int(m.group(1)) / 1e9, int(m.group(2), 16), bytes(raw))
+            raw = bytearray()
+            continue
+        m = ustack.match(line)
+        if m and current:
+            size, offset = int(m.group(1)), int(m.group(2), 16)
+            yield current[0], current[1], current[2][offset:offset + size]
+            current = None
+            continue
+        if "PERF_RECORD_" in line or "raw event" in line:
+            raw = bytearray()
+    proc.wait()
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("perf_data")
+    ap.add_argument("pid", nargs="?", help="process to read /proc/PID/maps from, while it still runs")
+    ap.add_argument("--maps", help="a saved copy of /proc/PID/maps instead of the PID")
+    ap.add_argument("--from", dest="t0", type=float, default=0, help="first sample time (perf seconds)")
+    ap.add_argument("--to", dest="t1", type=float, default=float("inf"), help="last sample time")
+    ap.add_argument("--depth", type=int, default=4, help="innermost frames per path (default 4)")
+    ap.add_argument("--module", help="start each path at the innermost frame of this image")
+    ap.add_argument("--top", type=int, default=25)
+    ap.add_argument("--all", action="store_true",
+                    help="also list the functions found in every sample (the message loop and the event)")
+    args = ap.parse_args()
+    if args.maps:
+        maps = open(args.maps).read().splitlines()
+    elif args.pid:
+        maps = open("/proc/%s/maps" % args.pid).read().splitlines()
+    else:
+        ap.error("give the PID or --maps")
+    ranges = load_images(maps)
+    starts = [r[0] for r in ranges]
+
+    inclusive = collections.Counter()
+    paths = collections.Counter()
+    per_second = collections.Counter()
+    total = 0
+    for t, ip, stack in samples(args.perf_data):
+        if not args.t0 <= t < args.t1 or ip > 0xFFFFFFFF:
+            continue
+        frames = []
+        for i in range(0, len(stack) - 3, 4):
+            addr = struct.unpack_from("<I", stack, i)[0]
+            img = find(ranges, starts, addr)
+            if img and img.follows_call(addr):
+                frames.append(img.name + "!" + img.symbol(addr))
+        total += 1
+        per_second[int(t)] += 1
+        for f in set(f.rsplit("+", 1)[0] for f in frames):
+            inclusive[f] += 1
+        if args.module:
+            frames = frames[[i for i, f in enumerate(frames) if f.startswith(args.module + "!")][0]:] \
+                if any(f.startswith(args.module + "!") for f in frames) else []
+        paths[tuple(frames[:args.depth])] += 1
+
+    print("%d samples of 32-bit code" % total)
+    print("\nsamples per second:", " ".join("%d:%d" % kv for kv in sorted(per_second.items())))
+    common = [f for f, n in inclusive.items() if n == total]
+    print("\nfunctions on the stack (inclusive):")
+    if common and not args.all:
+        print("  %d functions found in every sample are hidden, --all lists them" % len(common))
+    for f, n in [kv for kv in inclusive.most_common() if args.all or kv[1] < total][:args.top]:
+        print("%6d %5.1f%%  %s" % (n, 100.0 * n / max(total, 1), f))
+    print("\ninnermost frames, deepest first:")
+    for p, n in paths.most_common(args.top):
+        print("%6d  %s" % (n, "  <  ".join(p) or "(none)"))
+
+
+if __name__ == "__main__":
+    main()

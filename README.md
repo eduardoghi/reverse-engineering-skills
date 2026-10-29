@@ -32,6 +32,10 @@ Skills and helper scripts for Claude Code reverse-engineering work. New skills g
   (`strings`), reads the form resources to map each event to its method (`dfm`) and lists the
   published methods and fields of each class from its VMT, which also works on EXEs without exports
   (`vmt`).
+- `bin/pe-stacks`: call stacks of 32-bit Windows code from a `perf` recording of a Wine process, used by
+  the `wine-debugging` skill. Under wow64 `perf` can't unwind those frames, so it scans the raw user
+  stack that `--call-graph=dwarf` copies for return addresses into the PE images and names them from
+  the export tables.
 - `ghidra_scripts/ApplyNames.java`: Ghidra script that names functions from `bpl-xref vmt --names`,
   creating the ones Ghidra missed, used by the `binary-diff` skill before diffing Delphi executables.
 - `bin/kismet-trace`: reads Unreal Engine blueprint bytecode from a CUE4Parse JSON export. Prints the
@@ -60,6 +64,7 @@ ln -sfn "$PWD/bin/ue-save" ~/.local/bin/ue-save
 ln -sfn "$PWD/skills/binary-diff" ~/.claude/skills/binary-diff
 ln -sfn "$PWD/skills/binary-patch" ~/.claude/skills/binary-patch
 ln -sfn "$PWD/skills/wine-debugging" ~/.claude/skills/wine-debugging
+ln -sfn "$PWD/bin/pe-stacks" ~/.local/bin/pe-stacks
 ln -sfn "$PWD/skills/unreal-engine" ~/.claude/skills/unreal-engine
 ln -sfn "$PWD/skills/dotnet-decompile" ~/.claude/skills/dotnet-decompile
 java-decompile --check
