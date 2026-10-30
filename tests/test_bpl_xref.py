@@ -435,6 +435,14 @@ class StrTest(Fixtures):
         self.assertIn(f"nearest prologue 0x{VA_POST:08x}", out)
         self.assertIn("prev export 0x%08x @Uorders@TOrder@Post$qqrv" % VA_POST, out)
 
+    def test_fragment_reports_the_literal_that_holds_it(self):
+        for fragment in ("Pedido", "cancelado", "do – can"):
+            with self.subTest(fragment):
+                out = self.ok("str", self.bpl, fragment)
+                self.assertIn(f"{fragment!r} in {LITERAL!r} at 0x{self.at['literal']:08x}", out)
+                self.assertIn(f"    ref 0x{REF_LITERAL:08x}", out)
+                self.assertNotIn("no direct references", out)
+
     def test_literal_reference_without_relocations(self):
         out = self.ok("str", self.bare, LITERAL)
         self.assertIn(f"    ref 0x{REF_LITERAL:08x}", out)

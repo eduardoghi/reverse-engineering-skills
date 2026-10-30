@@ -635,7 +635,11 @@ def cmd_str(img, args):
     data = img.data
     any_match = False
     img.resource_strings()
+    literals = list(img.literals())
     for needle in args.strings:
+        # A fragment of a literal is reported once, through the literal that
+        # holds it, because code points at the first character.
+        holders = [(va, text, size) for va, text, size in literals if needle in text and text != needle]
         for enc in (ANSI, "utf-16-le"):
             try:
                 pat = needle.encode(enc)
@@ -650,7 +654,8 @@ def cmd_str(img, args):
                 # Text inside a string table is reported below through its
                 # resourcestring record, the only thing code points at.
                 in_table = any(lo <= off < hi for lo, hi in img.string_ranges)
-                if va is not None and (kind or terminated) and not in_table:
+                in_holder = va is not None and any(lit < va < lit + size for lit, _, size in holders)
+                if va is not None and (kind or terminated) and not in_table and not in_holder:
                     any_match = True
                     label = f", {kind}" if kind else ""
                     print(f"{needle!r} ({enc}{label}) at 0x{va:08x}")
@@ -672,6 +677,14 @@ def cmd_str(img, args):
                     else:
                         print("    no direct references")
                 off = data.find(pat, off + 1)
+        for va, text, _size in holders:
+            any_match = True
+            print(f"{needle!r} in {text!r} at 0x{va:08x}")
+            refs = [("ref" if img.in_code(ref) else "ptr", ref) for ref, _ in img.pointers_to({va})]
+            if refs:
+                print_refs(img, refs)
+            else:
+                print("    no direct references")
         if print_resstrings(img, needle):
             any_match = True
     if not any_match:
