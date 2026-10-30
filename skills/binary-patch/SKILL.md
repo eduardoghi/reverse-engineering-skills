@@ -90,6 +90,13 @@ preferred range is taken, so treat every absolute address as something the loade
   from the same registers, return in the same register, keep `ebx`, `esi`, `edi` and `ebp`, and leave
   the stack balanced. In Delphi's register convention the first three arguments are `eax`, `edx`,
   `ecx`. A Delphi method's Self is `eax`.
+- **Virtual methods.** A call to an exported or imported method runs that exact class's version, whatever
+  the object really is. If a descendant overrides it, the program may crash far from your code. One injected call to
+  a base class `SetBounds` on a windowed control sent a message with a null parameter, and the access violation
+  showed up inside the message handler. Look the method up in the VMT of the object's class, and when the slots
+  differ between base and descendant, call through the object (`mov ecx, [eax]`, then `call [ecx + slot]`).
+- **Registers across calls.** A callee may change `eax`, `ecx` and `edx`. Keep a value that must survive a
+  call on the stack or in a preserved register, and compute it after the calls that would destroy it.
 - **Replacing the start of a function.** Overwrite the prologue (`push ebp`, `mov ebp, esp`,
   `add esp, N`, usually 6 bytes) with a `jmp` and `nop`s. The cave replays those same instructions,
   does its work and jumps back to the first instruction after the replaced bytes. At that point
@@ -175,6 +182,8 @@ mu.mem_map(RET & ~0xfff, 0x1000)
 
 def fake(uc, addr, size, _):
     uc.reg_write(UC_X86_REG_EAX, results[addr].pop(0))   # value the real callee would return
+    uc.reg_write(UC_X86_REG_ECX, 0xBAD0BAD0)             # a real callee may change these two
+    uc.reg_write(UC_X86_REG_EDX, 0xBAD1BAD1)
     esp = uc.reg_read(UC_X86_REG_ESP)                    # return to the caller
     uc.reg_write(UC_X86_REG_EIP, struct.unpack('<I', uc.mem_read(esp, 4))[0])
     uc.reg_write(UC_X86_REG_ESP, esp + 4)
@@ -199,6 +208,16 @@ assert mu.reg_read(UC_X86_REG_EBX) == 0x11111111
 - To catch leaks, give the hooked allocator and string routines a model with reference counts and
   assert at the end that only the objects the code meant to keep are alive.
 - Assert that `ebx`, `esi`, `edi` and `ebp` come back unchanged on every exit, including the early exits.
+- A fake callee that leaves `ecx` and `edx` alone hides a whole class of bug. A value kept in `edx` across a call
+  passes the test and reaches the real callee as garbage. The same goes for a fake that stands in for a virtual
+  method: map a small fake VMT with the real slot offsets, so a direct call to the wrong version fails the test.
+- Code with `fs:[eax]` exception frames needs a segment. Some unicorn builds reject writes to
+  `UC_X86_REG_FS_BASE` with `UC_ERR_ARG`, and a hand-built GDT can break the stack as well. It is simpler to hook
+  each `fs:` instruction and emulate it against a mapped page (`push fs:[eax]`, `mov fs:[eax], esp`,
+  `mov fs:[eax], edx`), then advance `eip` past it.
+- To test the path where a callee raises, have its fake read the top frame from that page, unlink it, set `esp` to
+  the frame and `ebp` from its saved slot, and jump to its handler. Assert that the cleanup runs exactly once and
+  the frame chain is back where it started.
 
 Cover every case the code branches on, such as the empty state, each side of every comparison, the
 exact boundary values and counter wraparound. Hooks only need to map the page of the target, since
@@ -233,7 +252,12 @@ patched, or unknown, which means another build or a half applied patch).
   pattern at every zero of a run of megabytes, which is quadratic. Search for the literal window with
   the most non-zero bytes (16 bytes is enough), then compare the full pattern only where it matches.
   On a 14 MB file that took a real test from 572 seconds to 31.
-- Test that patches sharing a file apply in both orders, on synthetic data and on the real file.
+- The same rule holds for points of a single patch. Two windows close together, such as two neighbouring
+  strings, can each hold bytes the other one writes, so the second stops matching after the first is written. Make
+  those bytes wildcards as well.
+- Test that patches sharing a file apply in both orders, on synthetic data and on the real file. Checking that each
+  original pattern matches once isn't enough. Apply everything, then check that every patched pattern matches once
+  and no original pattern still does. Synthetic data, with each window laid out apart, can't show overlaps.
 
 ## When the program dies after patching
 
