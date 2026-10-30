@@ -339,6 +339,20 @@ for line in open(f'/proc/{pid}/maps'):
 - Reading another process needs ptrace permission. With `kernel.yama.ptrace_scope = 1` (the usual
   default) only a parent can read its child, and the read fails with `Permission denied`. Set it to
   0 with `sudo sysctl kernel.yama.ptrace_scope=0` for the session and back to 1 when done.
+  Without sudo, a program you start yourself can allow it for its own process, which is useful with
+  `strace -p` once it has settled, since starting it under `strace` slows down its startup. The
+  exception ends with the process, but while it runs any program of the same user can trace it.
+
+  ```sh
+  python3 -I -c 'import ctypes, os, sys
+  ctypes.CDLL(None).prctl(0x59616d61, ctypes.c_ulong(-1).value, 0, 0, 0)  # PR_SET_PTRACER, any
+  os.execv(sys.argv[1], sys.argv[1:])' ./program &
+  sleep 15
+  strace -f -e trace=ioctl -p $!
+  ```
+
+  `strace -k` adds a stack to each call and can slow a busy program so much that the trace no longer
+  shows its normal behavior. In one test, 15 seconds of tracing `ioctl` went from over 30,000 calls to about 300.
 - The first dword of every Delphi object is its class pointer, which is the address of the exported
   VMT symbol `@Unit@TClass@` (adjusted by the rebase delta if the package didn't load at its
   preferred base, which `/proc/PID/maps` shows). Scanning readable memory for aligned dwords equal
