@@ -18,11 +18,15 @@ Skills and helper scripts for Claude Code reverse-engineering work. New skills g
   a network share and the font engine cost, and capture a silent crash.
 - `skills/unreal-engine`: go from what a player sees in an Unreal Engine 4 game to the map or blueprint
   behind it, export it with CUE4Parse and read its bytecode with `kismet-trace`.
+- `skills/native-memory-tracing` finds what keeps growing in a native program on Linux without its source,
+  including GPU memory per DRM client, stacks of each allocation and isolation by layers.
 - `skills/dotnet-decompile`: decompile .NET assemblies to C# and XAML with ilspycmd, list the native
   functions they call and read the configuration and Entity Framework model of the program.
 
 ## Scripts
 
+- `bin/gem-log.c` is an `LD_PRELOAD` library for the `native-memory-tracing` skill that records the size and
+  stack of each i915 buffer a program creates.
 - `bin/java-decompile`: wrapper around Vineflower used by the `java-decompile` skill. Run it with `--help`
   for the options.
 - `bin/bpl-xref`: cross-references for 32-bit PE files, used by the `delphi-bpl` skill. Finds the code
@@ -67,6 +71,7 @@ ln -sfn "$PWD/skills/wine-debugging" ~/.claude/skills/wine-debugging
 ln -sfn "$PWD/bin/pe-stacks" ~/.local/bin/pe-stacks
 ln -sfn "$PWD/skills/unreal-engine" ~/.claude/skills/unreal-engine
 ln -sfn "$PWD/skills/dotnet-decompile" ~/.claude/skills/dotnet-decompile
+ln -sfn "$PWD/skills/native-memory-tracing" ~/.claude/skills/native-memory-tracing
 java-decompile --check
 bpl-xref --help > /dev/null && echo 'bpl-xref ok'   # fails if pefile is missing
 ```
@@ -112,6 +117,11 @@ Requirements for `binary-patch`:
 - Python 3 with `pefile`
 - `keystone` to assemble the new code and `unicorn` to run it before patching
   (`pacman -S python-keystone python-unicorn` on Arch, or `pip install keystone-engine unicorn` in a venv)
+
+Requirements for `native-memory-tracing`:
+
+- `strace` and `perf`, `gcc` and the kernel DRM headers for the allocation shim
+- `binutils` for `readelf` and `addr2line`
 
 Requirements for `wine-debugging`:
 
