@@ -36,7 +36,8 @@ plugin, and Ghidra 12.1.3 or newer with the ReVa extension for long sessions.
    bpl-xref str app.bpl 'CustomerName' 'Invalid order'
    ```
 
-   For each match it prints the literal kind guessed from the bytes before it (AnsiString,
+   A fragment works too. It is reported as `'Customer' in 'CustomerName' at 0x...`, with the references
+   of the literal that holds it. For each match it prints the literal kind guessed from the bytes before it (AnsiString,
    UnicodeString, ShortString), every relocated pointer to it in code, the nearest
    `push ebp; mov ebp, esp` before each reference and the exports around it. Nested procedures are
    not exported and sit right before their parent, so when the reference is between two exports the
@@ -240,6 +241,17 @@ plugin, and Ghidra 12.1.3 or newer with the ReVa extension for long sessions.
   `TTreeNode` has the text at +8 and `Data` at +0xC, and a `TStrings` descendant answers `IndexOf`, `Add`
   and `Delete` through virtual slots. Confirm each offset in code that already touches it (a handler that
   reads `[node+0xC]` before using `Data`) rather than trusting a table.
+- **Creating a VCL control from injected code.** Load the class pointer from the import slot of its VMT, call
+  the constructor (`mov dl, 1`, owner in `ecx`), then `SetParent`, `SetBounds`, `SetAnchors` and `SetText`, and keep
+  the object in a state cell that the form's `OnDestroy` hook clears. Both `SetParent` and `SetBounds` are virtual,
+  so call them through the object as described in the `binary-patch` skill. With a nil owner nothing frees the
+  control when the form goes away, so pass the form as owner when the control should die with it.
+- **Editing a string literal in place.** A shorter text fits if you write the new length and leave the total
+  size alone, padding with zeros after the new terminator. A longer one doesn't fit. To drop an argument from a
+  format string without touching the code, use an index: `'%1:s'` prints the second argument of
+  `'Item %d: %s'` and ignores the first. Run `bpl-xref str` first, because every reference to the literal gets the
+  new text, including screens you didn't mean to change. When a text doesn't change on screen, it may come from a
+  translation table and not from the literal.
 - **Exceptions with extra fields.** In an `on E: Exception do` handler the exception object is kept in a
   frame slot, saved right after the handler starts (`mov [ebp-0x30], eax`). A factory such as
   `CreateDet(cls, message, details)` stores the extra strings in fields after the standard ones. Code that
