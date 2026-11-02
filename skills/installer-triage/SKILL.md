@@ -19,7 +19,7 @@ it also rules out reading the target with an interpreter started from inside its
 
 ## Setup
 
-- `bin/inno-unpack`, Python 3 standard library only
+- `bin/inno-unpack`, `bin/nsis-script` and `bin/hsp-unpack`, Python 3 standard library only
 - `pefile` for the checks on binaries
 - `xxhash` to verify files from a modified build, `pycryptodome` for decrypting anything large
 - `capstone` when a finding needs reading machine code, and `delphi-bpl` or `binary-diff` to go deeper
@@ -35,7 +35,8 @@ it also rules out reading the target with an interpreter started from inside its
 2. **Identify the format.** `inno-unpack info setup.exe` answers for Inno Setup and says when the build
    is modified. For anything else look at the sections and the overlay. A `.rsrc` that ends well before
    the end of the file means the payload is an overlay, and its first bytes usually name the format.
-   7-Zip lists NSIS and plain SFX archives.
+   7-Zip lists NSIS and plain SFX archives. An overlay that starts with `DPMX` is an HSP program, not a
+   hidden payload, see below.
 
    ```sh
    inno-unpack info setup.exe
@@ -43,12 +44,17 @@ it also rules out reading the target with an interpreter started from inside its
    ```
 
 3. **Read what the installer declares.** This is where most droppers show themselves, as a `[Run]` entry
-   for something in `{tmp}`, a `Run` key in the registry, a file that lands in `{sys}` or a download.
+   for something in `{tmp}`, a `Run` key in the registry, a file that lands in `{sys}` or a download. For
+   NSIS, 7-Zip extracts the files but not the script, so use `nsis-script`, which prints each action.
 
    ```sh
    inno-unpack actions setup.exe
    inno-unpack list setup.exe | cut -f1,3 | sort -rn | head -30
+   nsis-script setup.exe
    ```
+
+   A signature covers the EXE and nothing beside it. An installer from the vendor can be driven by a
+   config file in the same folder, so read those too.
 
 4. **Disassemble the script.** The `[External]` section of `disasm` is the list of everything the script
    can call, and what isn't listed can't run, which makes it stronger evidence than any string search.
@@ -86,7 +92,24 @@ it also rules out reading the target with an interpreter started from inside its
    inno-unpack extract setup.exe out --password SECRET
    ```
 
-7. **Scan the unpacked files.** The scanner can finally see them. Run it in report-only mode over `out`.
+7. **Scan the unpacked files, one piece at a time.** The scanner can finally see them. A detection on an
+   archive doesn't say which file set it off, so run report-only over each executable and read the name of
+   the detection. `HackTool:Win32/Keygen` names a category and can be accurate about a file that does
+   nothing else. A heuristic name ending in `!cl` says less than a named family.
+
+   ```powershell
+   MpCmdRun.exe -Scan -ScanType 3 -File FILE -DisableRemediation
+   Get-MpThreatDetection | Sort-Object InitialDetectionTime -Descending
+   Get-MpThreat | Select-Object ThreatName, IsActive, DidThreatExecute
+   ```
+
+   `DidThreatExecute` tells a file that sat on disk from one that ran. Event 5007 in the Defender log
+   records changes to exclusions, which matters twice. An exclusion narrows what every other scan means,
+   and an installer that adds one is a finding by itself.
+
+   ```powershell
+   Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Windows Defender/Operational'; Id=5007}
+   ```
 
 8. **Check each binary.** A signature that names the vendor and reports `HashMismatch` means the file
    changed after signing. That is expected in a patched program, and it also means the vendor's signature
@@ -96,7 +119,31 @@ it also rules out reading the target with an interpreter started from inside its
    - extra sections, or an entry point outside `.text`
    - TLS callbacks, which run before the entry point
    - imports that differ between builds of the same code
+   - imports of a DLL that isn't part of Windows and isn't in the package
    - a PE embedded in the file, and hosts and IP addresses in its strings
+
+   A missing DLL is the one to chase. A patched plugin can swap `wininet.dll` and `ws2_32.dll` for
+   replacements that ship in a separate download. Until they exist the program can fail with a message
+   saying its own file wasn't found, even though the file is there, and reinstalling doesn't help. List
+   what doesn't resolve:
+
+   ```python
+   import os, sys, pefile
+   pe = pefile.PE(sys.argv[1], fast_load=True)
+   pe.parse_data_directories()
+   for entry in pe.DIRECTORY_ENTRY_IMPORT:
+       if not os.path.exists(os.path.join(r"C:\Windows\System32", entry.dll.decode())):
+           print(entry.dll.decode(), [i.name or f"#{i.ordinal}" for i in entry.imports])
+   ```
+
+   Those imports are often by ordinal, and for a `ws2_32` replacement the numbers keep their meaning, such
+   as 1 `accept`, 3 `closesocket`, 4 `connect`, 16 `recv`, 19 `send` and 23 `socket`.
+
+   A DLL described as doing nothing can be tested, because such a file is small enough to read in full.
+   Disassemble every export, stop at the first `ret` and group the bodies. Real stubs collapse into a few
+   shapes such as `xor eax, eax; ret`, and their imports are almost empty. Anything longer gets read.
+   Stubs have a cost worth stating too. One that replaces `WinVerifyTrust` answers yes for every file, for
+   whatever imports it.
 
    On x64, code built by MSVC is listed in `.pdata`, so bytes in `.text` outside it deserve a look. Most
    of them are harmless, see the table below. Compare the same check across builds of the same code, as
@@ -161,8 +208,34 @@ means nobody wrote about it.
 | `WinHttpOpen` in an Inno engine | the official engine has `winhttp` too, for downloads |
 | `iphlpapi`, `RegSaveKeyW`, printer APIs in a Delphi engine | units pulled in as a whole, or script helpers no script imports |
 | high entropy in `.rsrc` | PNG resources. List the resource types first |
+| `CreateRemoteThreadEx` as a string, not an import | a table of names in the Microsoft Concurrency Runtime, next to `CreateUmsCompletionList` |
+| `PowerShell.exe` with `DownloadFile` | can be a vendor's update check. Look for the update URL and product strings around it |
+| `cmd.exe /c start` | can open a local HTML file. Read the rest of the format string |
+| large overlay after a small runtime | a `DPMX` archive means HSP. Read `start.ax` before calling it a payload |
+| `HackTool:Win32/Keygen` | says what the file is, a key generator. It neither clears nor convicts it |
+| packed DLL from 2004 with one huge section | can be `BASSMOD.dll`, a tracker music player seen in keygens. Compare it across releases |
 
 None of these clears a file. They mean the string alone is not a finding.
+
+## Keygens
+
+The two R2R keygens these tools were built on are an NSIS wrapper around a few files in `%TEMP%`, with a
+runtime, a crypto DLL, a music player and a tracker module. `nsis-script` shows whether a wrapper only
+extracts, runs and deletes. Both are also written in HSP, which makes `keygen.exe` a stock runtime with the
+logic in an archive after it. `hsp-unpack` decodes that script and prints the DLLs and functions it declares,
+by library, and its strings.
+
+```sh
+nsis-script KeyGen.exe
+7z x KeyGen.exe -okg
+hsp-unpack script 'kg/$TEMP/keygen.exe'
+```
+
+A clean list here is a list of DLLs and text. It doesn't show HSP's built-in commands such as `exec`, and
+the instructions aren't disassembled, so run a keygen only in a disposable environment, with no network
+and no shared folders beyond an empty one for its output. A sandbox contains the program and proves nothing
+about it. One that notices the sandbox and stays quiet looks clean, so a quiet run isn't a reason to run it
+on the real machine. What matters is that only checked output leaves, such as a license file read as text.
 
 ## Modified Inno Setup builds
 
@@ -193,3 +266,13 @@ build it can't read. To add one, start from the facts the file gives away:
 - **Regexes with an open prefix.** `[\x20-\x7e]*keygen` on a 44 MB binary backtracks for minutes. Find
   the needle first, then widen around it.
 - **Substring filters.** Check what an indicator matched before reporting it, as the table above shows.
+- **Detections arrive late.** Defender logs a detection some seconds after the file was touched, so a copy
+  that looks fine at once can be gone a moment later. Wait, then read the log, before saying it passed.
+- **A scan that ends in seconds.** Tens of gigabytes scanned in two seconds weren't read in full, whatever
+  the result says. `Measure-Command` also swallows the output, so print the scanner's own line.
+- **Protection left off.** Disabling the scanner to read a file is the owner's call. Check its state at the
+  end and say so if it is still off.
+- **`python -I` ignores `PYTHONIOENCODING`.** Printing from a target then dies on the first character the
+  console can't encode. Use `python -X utf8 -I`.
+- **`set -e` isn't a gate.** It didn't stop a script that went on to commit after a failed step. Check the
+  result of each step before the next one that can't be undone.
