@@ -58,6 +58,22 @@ Skills and helper scripts for Claude Code reverse-engineering work. New skills g
 
 ## Setup
 
+Install it as a plugin, inside Claude Code 2.1.275 or later:
+
+```text
+/plugin install reverse-engineering-skills --marketplace eduardoghi/reverse-engineering-skills
+```
+
+On older versions, add the marketplace first:
+
+```text
+/plugin marketplace add eduardoghi/reverse-engineering-skills
+/plugin install reverse-engineering-skills@reverse-engineering-skills
+```
+
+The skills show up as `reverse-engineering-skills:java-decompile` and so on, and the scripts in `bin/` are on `PATH`
+inside Claude Code. To use the scripts outside it, or to work on a clone, link them instead.
+
 Claude Code loads personal skills from `~/.claude/skills`. Link each skill there and put the scripts on
 `PATH`. The links can be re-run safely:
 
