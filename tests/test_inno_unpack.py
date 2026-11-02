@@ -132,7 +132,7 @@ class FileSpec:
 
 def build(version="7.1.1", files=(), method="lzma", solid=True, run=(), uninstall_run=(), registry=(), ini=(),
           delete=(), icons=(), code=b"", encryption=0, encrypted_chunk=False, embedded=True, bad_digest=False,
-          uncompressed_blocks=False, unstored_chunk=False):
+          uncompressed_blocks=False, unstored_chunk=False, claimed_size=None):
     layout = inno.LAYOUTS[version]
     numbers = tuple(int(part) for part in version.split("."))
     wide_blocks = numbers >= (6, 7)
@@ -177,7 +177,8 @@ def build(version="7.1.1", files=(), method="lzma", solid=True, run=(), uninstal
         if method != "stored" and not unstored_chunk:
             flags |= 1 << compressed_bit
         record = struct.pack("<ii", 0, 0) + struct.pack("<Q" if wide else "<I", start)
-        record += struct.pack("<qqq", suboffset, len(item.data), size) + digest + bytes(16)
+        length = len(item.data) if claimed_size is None else claimed_size
+        record += struct.pack("<qqq", suboffset, length, size) + digest + bytes(16)
         record += flags.to_bytes(2 if old_flags else 1, "little")
         record += bytes(layout.location_fixed - len(record))
         locations += record
@@ -412,6 +413,29 @@ class Destinations(ToolCase):
         self.assertIn("leaves the output directory", err)
         self.assertEqual(os.listdir(outside), [])
 
+    def test_link_left_in_the_output_isnt_followed(self):
+        out = os.path.join(self.folder.name, "out")
+        victim = os.path.join(self.folder.name, "victim.txt")
+        with open(victim, "wb") as output:
+            output.write(b"untouched")
+        os.makedirs(os.path.join(out, "app"))
+        try:
+            os.symlink(victim, os.path.join(out, "app", "a.txt.part"))
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks aren't available here")
+        path = self.write(build("7.1.1", [FileSpec("{app}\\a.txt", b"data")]))
+        code, stdout, err = self.run_tool("extract", path, out)
+        self.assertEqual(code, 0, err + stdout)
+        with open(victim, "rb") as source:
+            self.assertEqual(source.read(), b"untouched")
+        self.assertEqual(self.read("app", "a.txt"), b"data")
+
+    def test_windows_device_names_are_renamed(self):
+        for name in ("CON", "con.txt", "CONIN$", "CONOUT$.log", "COM0", "LPT9.dat", "COM\u00b9", "NUL .txt"):
+            with self.subTest(name=name):
+                self.assertEqual(inno.safe_relative("{app}\\" + name), os.path.join("app", "_" + name))
+        self.assertEqual(inno.safe_relative("{app}\\CONSOLE.txt"), os.path.join("app", "CONSOLE.txt"))
+
     def test_variants_of_one_destination_are_all_kept(self):
         files = [FileSpec("{app}\\text.txt", b"english", language="english"),
                  FileSpec("{app}\\text.txt", b"german", language="german")]
@@ -444,7 +468,45 @@ class Destinations(ToolCase):
         self.assertEqual(self.read("app", "second.bin"), code_like(100000, seed=2))
 
 
+class Limits(unittest.TestCase):
+    def setUp(self):
+        original = inno.MAX_BLOCK
+        inno.MAX_BLOCK = 4096
+        self.addCleanup(setattr, inno, "MAX_BLOCK", original)
+
+    def test_block_that_expands_too_far_is_refused(self):
+        with self.assertRaisesRegex(inno.InnoError, "expands past"):
+            inno.read_block(block(bytes(1 << 20), wide=True), 0)
+
+    def test_block_at_the_limit_is_read(self):
+        data = block(bytes(4096), wide=True)
+        self.assertEqual(inno.read_block(data, 0), (bytes(4096), len(data)))
+
+    def test_dictionary_stays_under_the_ceiling(self):
+        chunk = bytes(8) + b"zlb\x1a" + LZMA_PROPS[:1] + struct.pack("<I", 0xFFFFFFFF) + bytes(32)
+        location = inno.Location(0, 0, 0, 8, 0, 16, len(chunk) - 12, b"", "sha256", False, False, True)
+        original = inno.lzma_filter
+        seen = []
+        self.addCleanup(setattr, inno, "lzma_filter", original)
+        inno.lzma_filter = lambda props, limit: seen.append(limit) or original(props, 4096)
+        inno.ChunkStream(chunk, location, "lzma", 1 << 40)
+        self.assertEqual(seen, [inno.MAX_DICTIONARY])
+
+
 class Failures(ToolCase):
+    def test_files_that_claim_more_than_the_free_space_are_refused(self):
+        data = build("7.1.1", [FileSpec("{app}\\a.bin", b"x")], claimed_size=1 << 62)
+        out, code, stdout, err = self.extract(data)
+        self.assertEqual(code, 2)
+        self.assertIn("claim", err)
+        self.assertEqual([name for _, _, names in os.walk(out) for name in names], [])
+
+    def test_negative_size_is_refused(self):
+        data = build("7.1.1", [FileSpec("{app}\\a.bin", b"x")], claimed_size=-1)
+        code, out, err = self.run_tool("list", self.write(data))
+        self.assertEqual(code, 2)
+        self.assertIn("negative", err)
+
     def test_hash_mismatch_keeps_nothing(self):
         out, code, stdout, err = self.extract(build("7.1.1", [FileSpec("{app}\\a.txt", b"data")], bad_digest=True))
         self.assertEqual(code, 1)

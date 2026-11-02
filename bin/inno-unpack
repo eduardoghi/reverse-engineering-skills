@@ -35,6 +35,7 @@ import re
 import shutil
 import struct
 import sys
+import tempfile
 import zlib
 from collections import namedtuple
 
@@ -43,6 +44,11 @@ SETUP_ID = re.compile(rb"Inno Setup Setup Data \(([0-9.]+)\)")
 CHUNK_ID = b"zlb\x1a"
 BLOCK_CHUNK = 4096
 FILTER_BLOCK = 0x10000  # has to match the buffer Setup decompresses with
+# The sizes in an installer are untrusted, so these limits don't depend on them. Blocks hold
+# metadata and images. Real chunks do use windows of hundreds of MiB, so a lower dictionary
+# limit would break them, and one over MAX_DICTIONARY fails with a data error.
+MAX_BLOCK = 1 << 28
+MAX_DICTIONARY = 1 << 31
 COMPRESSION = ("stored", "zip", "bzip2", "lzma", "lzma2")
 ENCRYPTION = ("none", "files", "full")
 # HKA is HKEY_AUTO, which Setup turns into HKLM or HKCU depending on the install mode.
@@ -50,7 +56,8 @@ REGISTRY_ROOTS = {1: "HKA", 0x80000000: "HKCR", 0x80000001: "HKCU", 0x80000002: 
                   0x80000005: "HKCC"}
 REG_TYPES = ("none", "string", "expandstring", "dword", "binary", "multistring", "qword")
 DELETE_TYPES = ("files", "filesandordirs", "dirifempty")
-WINDOWS_DEVICES = {"CON", "PRN", "AUX", "NUL"} | {f"{d}{i}" for d in ("COM", "LPT") for i in range(1, 10)}
+WINDOWS_DEVICES = {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"} | {
+    f"{device}{suffix}" for device in ("COM", "LPT") for suffix in "0123456789\u00b9\u00b2\u00b3"}
 
 # Each row comes from the packed records in Shared.Struct.pas of the release
 # that introduced the ID. Fixed sizes leave out the strings, which are stored
@@ -176,7 +183,10 @@ def read_block(view, pos):
     if compressed:
         decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_RAW,
                                              filters=[lzma_filter(data[:5], 1 << 30)])
-        return decompressor.decompress(bytes(data[5:])), end
+        plain = decompressor.decompress(bytes(data[5:]), max_length=MAX_BLOCK + 1)
+        if len(plain) > MAX_BLOCK:
+            raise InnoError(f"block expands past {MAX_BLOCK} bytes")
+        return plain, end
     return bytes(data), end
 
 
@@ -291,6 +301,8 @@ class Installer:
             start = struct.unpack_from("<Q" if wide_start else "<I", raw, pos)[0]
             pos += 8 if wide_start else 4
             suboffset, length, compressed_size = struct.unpack_from("<qqq", raw, pos)
+            if min(first, last, suboffset, length, compressed_size) < 0:
+                raise InnoError(f"negative size or offset in file location {index}")
             pos += 24
             digest = raw[pos:pos + digest_size]
             pos += digest_size + 16  # timestamp and file version
@@ -329,7 +341,7 @@ class ChunkStream:
             raise InnoError("chunk runs past the end of the file")
         self.tail = b""
         self.method = method if location.compressed else "stored"
-        limit = max(total, 1 << 16)
+        limit = min(max(total, 1 << 16), MAX_DICTIONARY)
         if self.method == "lzma":
             props = bytes(view[pos:pos + 5])
             self.pos += 5
@@ -412,7 +424,7 @@ def safe_relative(destination):
         part = re.sub(r'[<>:"|?*\x00-\x1f]', "_", part).rstrip(" .")
         if not part:
             continue
-        if part.split(".")[0].upper() in WINDOWS_DEVICES:
+        if part.split(".")[0].rstrip(" ").upper() in WINDOWS_DEVICES:
             part = "_" + part
         parts.append(part)
     return os.path.join(*parts) if parts else "unnamed"
@@ -432,13 +444,14 @@ def unique_path(path, digest, taken):
 def extract_location(stream, location, targets):
     """Copy one file out of the chunk, restoring the bytes, and verify its hash."""
     digest = hashlib.new(location.hash_name)
-    partial = targets[0] + ".part"
     os.makedirs(os.path.dirname(targets[0]), exist_ok=True)
+    # mkstemp doesn't follow a link left in the output, which a fixed name would.
+    descriptor, partial = tempfile.mkstemp(dir=os.path.dirname(targets[0]), suffix=".part")
     left = location.size
     address = 0
     try:
-        with open(partial, "wb") as output:
-            while left:
+        with os.fdopen(descriptor, "wb") as output:
+            while left > 0:
                 buffer = stream.read(min(left, FILTER_BLOCK))
                 if location.call_filter:
                     undo_call_filter(buffer, address)
@@ -448,6 +461,7 @@ def extract_location(stream, location, targets):
                 left -= len(buffer)
         if digest.digest() != location.digest:
             return False
+        os.chmod(partial, 0o644)
         os.replace(partial, targets[0])
     finally:
         if os.path.exists(partial):
@@ -640,6 +654,10 @@ def command_extract(installer, args):
             raise InnoError(f"destination leaves the output directory: {escape(destination)}")
         if path not in wanted.setdefault(index, []):
             wanted[index].append(path)
+    needed = sum(installer.locations[index].size for index in wanted)
+    available = shutil.disk_usage(output_root).free
+    if needed > available:
+        raise InnoError(f"the files claim {needed} bytes and {available} are free")
     chunks = {}
     for index in wanted:
         location = installer.locations[index]
@@ -697,6 +715,9 @@ def main():
                 raise InnoError("empty file")
             with mmap.mmap(source.fileno(), 0, access=mmap.ACCESS_READ) as view:
                 return args.handler(Installer(view), args) or 0
+    except MemoryError:
+        print("inno-unpack: not enough memory for this installer", file=sys.stderr)
+        return 2
     except (InnoError, lzma.LZMAError, zlib.error, OSError) as error:
         print(f"inno-unpack: {error}", file=sys.stderr)
         return 2
