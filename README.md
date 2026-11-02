@@ -59,7 +59,7 @@ Skills and helper scripts for Claude Code reverse-engineering work. New skills g
   setup engine with the call filter undone (`engine`) and the embedded files after checking each hash
   (`extract`). `--password` decrypts formats from 6.4 on, including `Encryption=full`. A modified build
   is reported as such, and the fork of 6.4.2 that uses XXH32 is read in full. Anything older than 6.0
-  still needs innoextract, and so do the ARC4 formats before 6.4.
+  still needs innoextract, except 5.5.7 (u), and so do the ARC4 formats before 6.4.
 
 ## Setup
 

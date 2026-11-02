@@ -278,7 +278,7 @@ def build(version="7.1.1", files=(), method="lzma", solid=True, run=(), uninstal
             setup0 += entry(strings, layout.run_strings, fixed)
     setup0 += struct.pack("<i", 0)
 
-    data = b"Inno Setup Setup Data (" + version.encode() + b")"
+    data = b"Inno Setup Setup Data (" + version.encode() + b")" + (b" (u)" if version == "5.5.7" else b"")
     data += bytes(64 - len(data))
     if modern:
         fields = bytes(48)
@@ -649,6 +649,12 @@ class Failures(ToolCase):
         code, out, err = self.run_tool("info", self.write(self.replace_id("7.1.1", "5.6.2")))
         self.assertEqual(code, 2)
         self.assertIn("innoextract", err)
+
+    def test_ansi_build_of_5_5_7_points_to_innoextract(self):
+        data = build("5.5.7", [FileSpec("{app}\\a.txt", b"x")]).replace(b"(5.5.7) (u)", b"(5.5.7)\0\0\0\0")
+        code, out, err = self.run_tool("info", self.write(data))
+        self.assertEqual(code, 2)
+        self.assertIn("without Unicode", err)
 
     def test_format_newer_than_the_table_is_refused(self):
         code, out, err = self.run_tool("info", self.write(self.replace_id("7.1.1", "9.9.9")))

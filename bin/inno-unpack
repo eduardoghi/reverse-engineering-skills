@@ -24,8 +24,9 @@ that actually runs, with the call filter undone so its CALL targets are real.
 stored in the installer, keeping only the ones that match.
 
 --password decrypts formats 6.4 and newer. Older ones use ARC4 and need innoextract,
-as does anything older than 6.0. The data has to be inside the EXE, so installers
-that ship setup-1.bin next to it can't be extracted.
+as does anything older than 6.0 except 5.5.7 (u), the Unicode build that release
+groups still use. The data has to be inside the EXE, so installers that ship
+setup-1.bin next to it can't be extracted.
 
 A modified build of Inno Setup is reported as such. Builds that keep the format of
 6.4.2 but swap CRC32 for XXH32 are read in full. Their file digests are XXH128, so
@@ -66,7 +67,7 @@ except ImportError:
         FastChaCha20 = None
 
 LDR_ID = b"rDlPtS\xcd\xe6\xd7\x7b\x0b\x2a"
-SETUP_ID = re.compile(rb"Inno Setup Setup Data \(([0-9.]+)\)")
+SETUP_ID = re.compile(rb"Inno Setup Setup Data \(([0-9.]+)\)( \(u\))?")
 CHUNK_ID = b"zlb\x1a"
 BLOCK_CHUNK = 4096
 FILTER_BLOCK = 0x10000  # has to match the buffer Setup decompresses with
@@ -89,11 +90,13 @@ WINDOWS_DEVICES = {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"} | {
 # that introduced the ID. Fixed sizes leave out the strings, which are stored
 # first with a length prefix. Releases that kept the format kept the ID, so
 # 6.1.0 also covers 6.2, 6.7.0 covers up to 6.7.4 and 7.0.0.3 covers up to 7.1.0.
-# 6.4.0 only appeared in a prerelease.
+# 6.4.0 only appeared in a prerelease. 5.5.7 is the Unicode build only, whose ID ends in
+# " (u)", because the ANSI build stores its strings differently.
 Layout = namedtuple("Layout", "header_strings header_fixed compress_offset language_strings language_fixed "
                               "component_fixed task_fixed file_strings file_ansi file_fixed icon_fixed "
                               "registry_fixed run_strings run_fixed location_fixed")
 LAYOUTS = {
+    "5.5.7": Layout(28, 157, 138, 6, 21, 42, 26, 10, 0, 43, 32, 29, 13, 27, 74),
     "6.0.0": Layout(30, 167, 148, 6, 21, 42, 26, 10, 0, 43, 32, 29, 13, 27, 74),
     "6.1.0": Layout(30, 167, 148, 6, 21, 42, 26, 10, 0, 43, 48, 29, 13, 27, 74),
     "6.3.0": Layout(32, 166, 148, 6, 21, 42, 26, 10, 0, 43, 48, 29, 13, 27, 75),
@@ -402,6 +405,8 @@ class Installer:
         if not match:
             raise InnoError(f"no setup data at {self.offset0:#x}, the installer may use a modified format")
         self.version = match.group(1).decode()
+        if self.version == "5.5.7" and not match.group(2):
+            raise InnoError("format 5.5.7 without Unicode is older than 6.0, use innoextract")
         if self.version not in LAYOUTS:
             known = tuple(int(part) for part in self.version.split("."))
             if known < (6,):
