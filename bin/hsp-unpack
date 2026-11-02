@@ -35,6 +35,8 @@ TOTAL_SIZE, DATA_SEGMENT, LIBRARIES, FUNCTIONS = 3, 6, 12, 14
 LIBRARY_SIZE, FUNCTION_SIZE = 16, 28
 # STRUCTDAT.index is a library number, or negative for the script's own functions.
 FIRST_LIBRARY_FUNCTION = 0
+WINDOWS_DEVICES = {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"} | {
+    f"{device}{suffix}" for device in ("COM", "LPT") for suffix in "0123456789¹²³"}
 
 
 class HspError(Exception):
@@ -168,18 +170,33 @@ def command_script(data, args):
 
 
 def safe_name(name):
+    """Map a name from the archive to one that stays in the output and isn't a Windows device."""
     base = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
+    if base.split(".")[0].rstrip(" ").upper() in WINDOWS_DEVICES:
+        base = "_" + base
     return base or "unnamed"
+
+
+def unique_name(name, taken):
+    """Keep entries that map to one name under numbered names, ignoring case as Windows does."""
+    candidate = name
+    number = 1
+    while candidate.lower() in taken:
+        number += 1
+        candidate = f"{name}~{number}"
+    taken.add(candidate.lower())
+    return candidate
 
 
 def command_extract(data, args):
     entries = read_archive(data)
     os.makedirs(args.dir, exist_ok=True)
+    taken = set()
     for entry in entries:
         blob = data[entry.offset:entry.offset + entry.size]
         if entry.name.lower().endswith(".ax"):
             blob = decode_script(blob)
-        with open(os.path.join(args.dir, safe_name(entry.name)), "wb") as output:
+        with open(os.path.join(args.dir, unique_name(safe_name(entry.name), taken)), "wb") as output:
             output.write(blob)
     print(f"{len(entries)} files written to {escape(args.dir)}")
 

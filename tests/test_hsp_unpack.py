@@ -172,6 +172,29 @@ class Commands(ToolCase):
         self.assertFalse(os.path.exists(os.path.join(self.folder.name, "evil.txt")))
         self.assertFalse(os.path.exists(os.path.join(self.folder.name, "up.txt")))
 
+    def test_windows_device_names_are_renamed(self):
+        for name in ("CON", "con.txt", "NUL .txt", "CONIN$", "COM1", "LPT9.dat", "COM¹"):
+            with self.subTest(name=name):
+                self.assertEqual(hsp.safe_name(name), "_" + name)
+        self.assertEqual(hsp.safe_name("CONSOLE.txt"), "CONSOLE.txt")
+
+    def test_device_names_are_written_as_files(self):
+        target = os.path.join(self.folder.name, "out")
+        code, out, err = self.run_tool("extract", self.write(program([("NUL", b"x"), ("con.txt", b"y")])), target)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sorted(os.listdir(target)), ["_NUL", "_con.txt"])
+
+    def test_entries_with_one_name_are_all_kept(self):
+        data = program([("bg.bmp", b"one"), ("BG.BMP", b"two"), ("bg/bmp", b"three"), ("bg_bmp", b"four")])
+        target = os.path.join(self.folder.name, "out")
+        code, out, err = self.run_tool("extract", self.write(data), target)
+        self.assertEqual(code, 0, err)
+        kept = set()
+        for name in os.listdir(target):
+            with open(os.path.join(target, name), "rb") as source:
+                kept.add(source.read())
+        self.assertEqual(kept, {b"one", b"two", b"three", b"four"})
+
     def test_control_characters_are_escaped(self):
         plain = script(strings=["red\x1b[31m"])
         code, out, err = self.run_tool("script", self.write(program([("start.ax", plain)])))
