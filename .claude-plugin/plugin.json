@@ -1,6 +1,6 @@
 {
     "name": "reverse-engineering-skills",
-    "description": "Skills and helper scripts for reverse engineering: Java, .NET and Delphi binaries, Unreal Engine games, binary diffing and patching, Wine debugging and native memory tracing.",
+    "description": "Skills and helper scripts for reverse engineering: Java, .NET and Delphi binaries, Unreal Engine games, binary diffing and patching, installer triage, Wine debugging and native memory tracing.",
     "version": "0.1.0",
     "author": {
         "name": "Eduardo Hillesheim"

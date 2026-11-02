@@ -22,6 +22,8 @@ Skills and helper scripts for Claude Code reverse-engineering work. New skills g
   including GPU memory per DRM client, stacks of each allocation and isolation by layers.
 - `skills/dotnet-decompile`: decompile .NET assemblies to C# and XAML with ilspycmd, list the native
   functions they call and read the configuration and Entity Framework model of the program.
+- `skills/installer-triage`: decide whether a Windows installer or the programs inside it look malicious
+  without running anything, from what the installer declares to tampering in each binary.
 
 ## Scripts
 
@@ -52,9 +54,12 @@ Skills and helper scripts for Claude Code reverse-engineering work. New skills g
   the plain GVAS (`unpack`).
 - `bin/inno-unpack` reads Inno Setup installers from version 6.0 to 7.1 without running them. Prints
   the format and how the data is stored (`info`), the files with size and hash (`list`), what the
-  installer does besides copying files (`actions`) and the names and strings in the compiled `[Code]`
-  script (`code`), and writes the embedded files after checking each hash (`extract`). Anything older
-  than 6.0 still needs innoextract.
+  installer does besides copying files (`actions`), the names and strings in the compiled `[Code]`
+  script (`code`) and its disassembly with every external function it can reach (`disasm`), writes the
+  setup engine with the call filter undone (`engine`) and the embedded files after checking each hash
+  (`extract`). `--password` decrypts formats from 6.4 on, including `Encryption=full`. A modified build
+  is reported as such, and the fork of 6.4.2 that uses XXH32 is read in full. Anything older than 6.0
+  still needs innoextract, and so do the ARC4 formats before 6.4.
 
 ## Setup
 
@@ -94,6 +99,7 @@ ln -sfn "$PWD/skills/unreal-engine" ~/.claude/skills/unreal-engine
 ln -sfn "$PWD/skills/dotnet-decompile" ~/.claude/skills/dotnet-decompile
 ln -sfn "$PWD/skills/native-memory-tracing" ~/.claude/skills/native-memory-tracing
 ln -sfn "$PWD/bin/inno-unpack" ~/.local/bin/inno-unpack
+ln -sfn "$PWD/skills/installer-triage" ~/.claude/skills/installer-triage
 java-decompile --check
 bpl-xref --help > /dev/null && echo 'bpl-xref ok'   # fails if pefile is missing
 ```
@@ -132,6 +138,15 @@ Requirements for `kismet-trace`:
 Requirements for `inno-unpack`:
 
 - Python 3, standard library only
+- Optional, `pycryptodome` to decrypt large installers, since plain Python manages about half a megabyte
+  per second
+- Optional, `xxhash` to verify the files of a modified build, which are otherwise written but reported
+  as not verified
+
+Requirements for `installer-triage`:
+
+- `inno-unpack`, above
+- Python 3 with `pefile`, and `capstone` to read machine code when a finding calls for it
 
 Requirements for `binary-diff`:
 
@@ -182,7 +197,10 @@ bpl-xref vmt app.exe TFORDEREDIT
 inno-unpack info setup.exe
 inno-unpack actions setup.exe
 inno-unpack code setup.exe --dump script.bin
+inno-unpack disasm setup.exe --proc CurPageChanged
+inno-unpack engine setup.exe engine.bin
 inno-unpack extract setup.exe /tmp/setup-files --only '*.exe'
+inno-unpack extract setup.exe /tmp/setup-files --password secret
 ```
 
 `--clean` only empties directories that java-decompile created or initialized while they were empty
@@ -197,7 +215,7 @@ python3 -m unittest discover -s tests
 The tests build their inputs in code (small PE files for `bpl-xref`, a blueprint export for
 `kismet-trace`, localization files and saves for `ue-locres` and `ue-save`, installers of every
 format for `inno-unpack`), so no real binaries or games are needed. The `bpl-xref` tests need `pefile` and are
-skipped without it.
+skipped without it, and the `inno-unpack` tests that check XXH128 digests need `xxhash`.
 
 ## License
 

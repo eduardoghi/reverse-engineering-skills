@@ -9,7 +9,7 @@
         {
             "name": "reverse-engineering-skills",
             "source": "./",
-            "description": "Java, .NET and Delphi binaries, Unreal Engine games, binary diffing and patching, Wine debugging and memory tracing"
+            "description": "Java, .NET and Delphi binaries, Unreal Engine games, binary diffing and patching, installer triage, Wine debugging and memory tracing"
         }
     ]
 }
