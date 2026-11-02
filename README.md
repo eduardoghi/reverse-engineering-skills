@@ -60,6 +60,11 @@ Skills and helper scripts for Claude Code reverse-engineering work. New skills g
   (`extract`). `--password` decrypts formats from 6.4 on, including `Encryption=full`. A modified build
   is reported as such, and the fork of 6.4.2 that uses XXH32 is read in full. Anything older than 6.0
   still needs innoextract, except 5.5.7 (u), and so do the ARC4 formats before 6.4.
+- `bin/nsis-script` prints what an NSIS 3 Unicode installer does without running it, such as the files it
+  extracts, what it runs and the registry keys it writes. 7-Zip extracts the files but doesn't show this.
+- `bin/hsp-unpack` reads programs written in HSP without running them. Lists the DPMX archive that follows
+  the runtime (`list`), decodes `start.ax` and prints the DLLs and functions it declares and its strings
+  (`script`) and writes the files (`extract`).
 
 ## Setup
 
@@ -99,6 +104,8 @@ ln -sfn "$PWD/skills/unreal-engine" ~/.claude/skills/unreal-engine
 ln -sfn "$PWD/skills/dotnet-decompile" ~/.claude/skills/dotnet-decompile
 ln -sfn "$PWD/skills/native-memory-tracing" ~/.claude/skills/native-memory-tracing
 ln -sfn "$PWD/bin/inno-unpack" ~/.local/bin/inno-unpack
+ln -sfn "$PWD/bin/nsis-script" ~/.local/bin/nsis-script
+ln -sfn "$PWD/bin/hsp-unpack" ~/.local/bin/hsp-unpack
 ln -sfn "$PWD/skills/installer-triage" ~/.claude/skills/installer-triage
 java-decompile --check
 bpl-xref --help > /dev/null && echo 'bpl-xref ok'   # fails if pefile is missing
@@ -143,9 +150,13 @@ Requirements for `inno-unpack`:
 - Optional, `xxhash` to verify the files of a modified build, which are otherwise written but reported
   as not verified
 
+Requirements for `nsis-script` and `hsp-unpack`:
+
+- Python 3, standard library only
+
 Requirements for `installer-triage`:
 
-- `inno-unpack`, above
+- `inno-unpack`, `nsis-script` and `hsp-unpack`, above
 - Python 3 with `pefile`, and `capstone` to read machine code when a finding calls for it
 
 Requirements for `binary-diff`:
@@ -201,6 +212,12 @@ inno-unpack disasm setup.exe --proc CurPageChanged
 inno-unpack engine setup.exe engine.bin
 inno-unpack extract setup.exe /tmp/setup-files --only '*.exe'
 inno-unpack extract setup.exe /tmp/setup-files --password secret
+
+nsis-script setup.exe --strings
+
+hsp-unpack list keygen.exe
+hsp-unpack script keygen.exe --dump start.ax
+hsp-unpack extract keygen.exe /tmp/keygen-files
 ```
 
 `--clean` only empties directories that java-decompile created or initialized while they were empty
@@ -214,7 +231,8 @@ python3 -m unittest discover -s tests
 
 The tests build their inputs in code (small PE files for `bpl-xref`, a blueprint export for
 `kismet-trace`, localization files and saves for `ue-locres` and `ue-save`, installers of every
-format for `inno-unpack`), so no real binaries or games are needed. The `bpl-xref` tests need `pefile` and are
+format for `inno-unpack` and `nsis-script`, DPMX archives for `hsp-unpack`), so no real binaries or
+games are needed. The `bpl-xref` tests need `pefile` and are
 skipped without it, and the `inno-unpack` tests that check XXH128 digests need `xxhash`.
 
 ## License

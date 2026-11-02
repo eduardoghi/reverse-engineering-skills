@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""Read programs written in HSP (Hot Soup Processor) without running them.
+
+  hsp-unpack list FILE
+  hsp-unpack script FILE [--dump OUT]
+  hsp-unpack extract FILE DIR
+
+An HSP program is a stock runtime with a DPMX archive appended to it, so the PE on
+its own says nothing about what the program does and the overlay looks like a hidden
+payload. The logic sits in start.ax inside that archive. `list` prints the files of
+the archive. `script` decodes start.ax and prints the DLLs and functions it declares
+and its strings. `extract` writes the files under DIR, with start.ax decoded.
+
+start.ax is scrambled with a key of two bytes, which is recovered from the HSP3 magic
+that every script starts with. The instructions aren't disassembled, and HSP's own
+commands such as exec aren't in the tables printed here, so a script can still do
+more than its strings show.
+
+Everything in the file is treated as untrusted. Strings are escaped before printing
+and names can't leave DIR.
+"""
+import argparse
+import os
+import re
+import struct
+import sys
+from collections import namedtuple
+
+ARCHIVE_ID = b"DPMX"
+SCRIPT_ID = b"HSP3"
+ENTRY_SIZE = 32
+# Fields of HSPHED, in 32-bit words. The sections are pairs of offset and size.
+HEADER_WORDS = 20
+TOTAL_SIZE, DATA_SEGMENT, LIBRARIES, FUNCTIONS = 3, 6, 12, 14
+LIBRARY_SIZE, FUNCTION_SIZE = 16, 28
+# STRUCTDAT.index is a library number, or negative for the script's own functions.
+FIRST_LIBRARY_FUNCTION = 0
+
+
+class HspError(Exception):
+    pass
+
+
+Entry = namedtuple("Entry", "name seed offset size")
+
+
+def escape(text):
+    """Keep names from the file from reaching the terminal as control sequences."""
+    return "".join(char if char == "\\" or char.isprintable() else f"\\u{ord(char):04x}" for char in text)
+
+
+def read_archive(data):
+    """Return the entries of the DPMX archive and where their data starts.
+
+    The first word after the ID is the size of the table, which tells a real archive
+    from the same four bytes elsewhere in the runtime.
+    """
+    pos = data.find(ARCHIVE_ID)
+    while pos >= 0:
+        table_size, count = struct.unpack_from("<II", data, pos + 4) if pos + 12 <= len(data) else (0, 0)
+        if count and table_size == 16 + count * ENTRY_SIZE and pos + table_size <= len(data):
+            start = pos + table_size
+            entries = []
+            for index in range(count):
+                raw = data[pos + 16 + index * ENTRY_SIZE:pos + 16 + (index + 1) * ENTRY_SIZE]
+                name = raw[:16].split(b"\0")[0].decode("latin1")
+                seed, offset, size = struct.unpack_from("<III", raw, 20)
+                if start + offset + size > len(data):
+                    raise HspError(f"{escape(name)} runs past the end of the file")
+                entries.append(Entry(name, seed, start + offset, size))
+            return entries
+        pos = data.find(ARCHIVE_ID, pos + 1)
+    raise HspError("no DPMX archive found, this isn't an HSP executable")
+
+
+def unscramble(blob, xor_key, add_key):
+    """Undo the transform of start.ax, where each byte encodes a difference from the last."""
+    table = bytes(((value ^ xor_key) + add_key) & 0xFF for value in range(256))
+    out = bytearray(len(blob))
+    previous = 0
+    for index, value in enumerate(blob.translate(table)):
+        previous = (previous + value) & 0xFF
+        out[index] = previous
+    return bytes(out)
+
+
+def decode_script(blob):
+    """Recover the key from the known start of the script and return the plain script.
+
+    The magic alone leaves a few candidates, so the size in the header has to match too.
+    """
+    if len(blob) < HEADER_WORDS * 4:
+        raise HspError("start.ax is too short to hold a header")
+    if blob[:4] == SCRIPT_ID:
+        return blob
+    for xor_key in range(256):
+        add_key = (SCRIPT_ID[0] - (blob[0] ^ xor_key)) & 0xFF
+        start = unscramble(blob[:HEADER_WORDS * 4], xor_key, add_key)
+        if start[:4] == SCRIPT_ID and struct.unpack_from("<I", start, TOTAL_SIZE * 4)[0] == len(blob):
+            return unscramble(blob, xor_key, add_key)
+    raise HspError("start.ax doesn't decode to an HSP3 script with this transform")
+
+
+class Script:
+    def __init__(self, data):
+        self.data = data
+        self.words = struct.unpack_from(f"<{HEADER_WORDS}I", data)
+        self.segment = self._section(DATA_SEGMENT)
+
+    def _section(self, field):
+        offset, size = self.words[field], self.words[field + 1]
+        if offset + size > len(self.data):
+            raise HspError("a section runs past the end of the script")
+        return self.data[offset:offset + size]
+
+    def text(self, index):
+        if index >= len(self.segment):
+            return ""
+        return self.segment[index:self.segment.find(b"\0", index)].decode("cp932", "replace")
+
+    def libraries(self):
+        raw = self._section(LIBRARIES)
+        return [struct.unpack_from("<iiii", raw, pos) for pos in range(0, len(raw) - LIBRARY_SIZE + 1, LIBRARY_SIZE)]
+
+    def imports(self):
+        """Return each declared library with the functions the script binds from it."""
+        libraries = [self.text(entry[1]) for entry in self.libraries()]
+        found = {index: [] for index in range(len(libraries))}
+        raw = self._section(FUNCTIONS)
+        for pos in range(0, len(raw) - FUNCTION_SIZE + 1, FUNCTION_SIZE):
+            index = struct.unpack_from("<h", raw, pos)[0]
+            name = struct.unpack_from("<i", raw, pos + 12)[0]
+            if index >= FIRST_LIBRARY_FUNCTION and index in found and name >= 0:
+                found[index].append(self.text(name))
+        return [(library, found[index]) for index, library in enumerate(libraries)]
+
+    def strings(self):
+        return [item.decode("cp932", "replace") for item in self.segment.split(b"\0") if len(item) >= 4]
+
+
+def script_entry(data, entries):
+    for entry in entries:
+        if entry.name.lower().endswith(".ax"):
+            return entry
+    raise HspError("the archive holds no compiled script")
+
+
+def command_list(data, args):
+    for entry in read_archive(data):
+        print(f"{entry.size}\t{escape(entry.name)}")
+
+
+def command_script(data, args):
+    entries = read_archive(data)
+    entry = script_entry(data, entries)
+    plain = decode_script(data[entry.offset:entry.offset + entry.size])
+    if args.dump:
+        with open(args.dump, "wb") as output:
+            output.write(plain)
+    script = Script(plain)
+    print("[Imports]")
+    for library, functions in script.imports():
+        print("\t".join([escape(library)] + [escape(name) for name in functions]))
+    print()
+    print("[Strings]")
+    for text in script.strings():
+        print(escape(text))
+
+
+def safe_name(name):
+    base = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
+    return base or "unnamed"
+
+
+def command_extract(data, args):
+    entries = read_archive(data)
+    os.makedirs(args.dir, exist_ok=True)
+    for entry in entries:
+        blob = data[entry.offset:entry.offset + entry.size]
+        if entry.name.lower().endswith(".ax"):
+            blob = decode_script(blob)
+        with open(os.path.join(args.dir, safe_name(entry.name)), "wb") as output:
+            output.write(blob)
+    print(f"{len(entries)} files written to {escape(args.dir)}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Read HSP executables without running them.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    command = commands.add_parser("list", help="files of the DPMX archive")
+    command.add_argument("file")
+    command.set_defaults(handler=command_list)
+    command = commands.add_parser("script", help="imports and strings of start.ax")
+    command.add_argument("file")
+    command.add_argument("--dump", help="also write the decoded script to this file")
+    command.set_defaults(handler=command_script)
+    command = commands.add_parser("extract", help="write the files, with start.ax decoded")
+    command.add_argument("file")
+    command.add_argument("dir")
+    command.set_defaults(handler=command_extract)
+    args = parser.parse_args()
+    try:
+        with open(args.file, "rb") as source:
+            data = source.read()
+        args.handler(data, args)
+    except (HspError, OSError, struct.error) as error:
+        print(f"hsp-unpack: {error}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
