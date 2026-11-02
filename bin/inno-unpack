@@ -5,7 +5,11 @@
   inno-unpack list FILE
   inno-unpack actions FILE
   inno-unpack code FILE [--dump OUT]
+  inno-unpack disasm FILE [--proc NAME]
+  inno-unpack engine FILE OUT
   inno-unpack extract FILE DIR [--only GLOB]
+
+Every command also takes --password.
 
 `info` prints the format version, the application and how the data is stored.
 `list` prints size, hash and destination of each file. `actions` prints what the
@@ -13,13 +17,23 @@ installer does besides copying files, which means the commands it runs, registry
 and INI changes, deletions, shortcuts, DLLs it registers and files it fetches. `code`
 lists the names and strings found in the compiled [Code] script. It scans the
 bytecode instead of decompiling it, so it says what the script can call, not
-when. `extract` writes the embedded files under DIR and checks each one against
-the hash stored in the installer, keeping only the ones that match.
+when. `disasm` disassembles that script, with the full list of external functions
+it can reach. `engine` writes the setup engine stored in the installer, the program
+that actually runs, with the call filter undone so its CALL targets are real.
+`extract` writes the embedded files under DIR and checks each one against the hash
+stored in the installer, keeping only the ones that match.
 
-Older installers need innoextract. Nothing here decrypts, so an installer
-encrypted in full can't be read and one with encrypted files can be listed but
-not extracted. The data has to be inside the EXE, so installers that ship
-setup-1.bin next to it can't be extracted either.
+--password decrypts formats 6.4 and newer. Older ones use ARC4 and need innoextract,
+as does anything older than 6.0. The data has to be inside the EXE, so installers
+that ship setup-1.bin next to it can't be extracted.
+
+A modified build of Inno Setup is reported as such. Builds that keep the format of
+6.4.2 but swap CRC32 for XXH32 are read in full. Their file digests are XXH128, so
+checking them needs the xxhash module, and without it the files are written but
+reported as not verified.
+
+The standard library is enough for everything. PyCryptodome speeds up decryption,
+which is too slow for large installers in plain Python.
 
 Everything in an installer is treated as untrusted. Strings are escaped before
 printing and destinations can't leave DIR.
@@ -38,6 +52,18 @@ import sys
 import tempfile
 import zlib
 from collections import namedtuple
+
+try:
+    import xxhash
+except ImportError:
+    xxhash = None
+try:
+    from Cryptodome.Cipher import ChaCha20 as FastChaCha20
+except ImportError:
+    try:
+        from Crypto.Cipher import ChaCha20 as FastChaCha20
+    except ImportError:
+        FastChaCha20 = None
 
 LDR_ID = b"rDlPtS\xcd\xe6\xd7\x7b\x0b\x2a"
 SETUP_ID = re.compile(rb"Inno Setup Setup Data \(([0-9.]+)\)")
@@ -86,6 +112,18 @@ LAYOUTS = {
 }
 HEADER_ANSI = 4
 
+# A fork of 6.4.2, recognized by its XXH32 checksums. The KDF salt grows from 16 to 64
+# bytes, which adds 48 to the header, and the digest shrinks from 32 to 16 bytes. Its
+# compression enum is also reordered. FastLZMA2 hasn't been seen in a real file, but
+# that encoder writes plain LZMA2.
+MODIFIED_LAYOUTS = {"6.4.2": LAYOUTS["6.4.2"]._replace(header_fixed=225, compress_offset=208, location_fixed=71)}
+MODIFIED_COMPRESSION = ("lzma2", "lzma", "lzma2", "zip", "bzip2", "stored")
+# Where 6.4 keeps PasswordTest in the header, before the salt, iterations and nonce.
+HEADER_PASSWORD_TEST = 94
+ENCRYPTED_FROM = (6, 4)
+# SpecialFirstSlice of each TSpecialCryptContextType.
+SLICE_PASSWORD_TEST, SLICE_BLOCK_SETUP, SLICE_BLOCK_LOCATIONS = -1, -2, -3
+
 # Strings the tool reads, by position in the record.
 APP_NAME, APP_VER_NAME, APP_ID, APP_PUBLISHER, APP_VERSION = 0, 1, 2, 4, 9
 LICENSE, CODE = 0, 3
@@ -112,8 +150,14 @@ class Reader:
         self.pos += n
         return chunk
 
+    def u8(self):
+        return self.take(1)[0]
+
     def u32(self):
         return struct.unpack("<I", self.take(4))[0]
+
+    def i32(self):
+        return struct.unpack("<i", self.take(4))[0]
 
     def text(self):
         raw = self.take(self.u32())
@@ -139,7 +183,118 @@ def read_entries(reader, count, strings, ansi, fixed):
     return entries
 
 
-def block_header(view, pos):
+def xxh32(data, seed=0):
+    """XXH32 of data, for builds that replace CRC32 with it."""
+    if xxhash:
+        return xxhash.xxh32_intdigest(bytes(data), seed)
+    mask = 0xFFFFFFFF
+    prime1, prime2, prime3, prime4, prime5 = 2654435761, 2246822519, 3266489917, 668265263, 374761393
+
+    def rotate(value, bits):
+        return (value << bits | value >> (32 - bits)) & mask
+
+    length = len(data)
+    pos = 0
+    if length >= 16:
+        lanes = [(seed + prime1 + prime2) & mask, (seed + prime2) & mask, seed & mask, (seed - prime1) & mask]
+        for pos in range(0, length - length % 16, 16):
+            for index, word in enumerate(struct.unpack_from("<4I", data, pos)):
+                lanes[index] = rotate((lanes[index] + word * prime2) & mask, 13) * prime1 & mask
+        pos = length - length % 16
+        result = (rotate(lanes[0], 1) + rotate(lanes[1], 7) + rotate(lanes[2], 12) + rotate(lanes[3], 18)) & mask
+    else:
+        result = (seed + prime5) & mask
+    result = (result + length) & mask
+    while pos + 4 <= length:
+        result = rotate((result + struct.unpack_from("<I", data, pos)[0] * prime3) & mask, 17) * prime4 & mask
+        pos += 4
+    while pos < length:
+        result = rotate((result + data[pos] * prime5) & mask, 11) * prime1 & mask
+        pos += 1
+    result = (result ^ result >> 15) * prime2 & mask
+    result = (result ^ result >> 13) * prime3 & mask
+    return result ^ result >> 16
+
+
+CHACHA_CONSTANTS = (0x61707865, 0x3320646E, 0x79622D32, 0x6B206574)
+CHACHA_ROUNDS = ((0, 4, 8, 12), (1, 5, 9, 13), (2, 6, 10, 14), (3, 7, 11, 15),
+                 (0, 5, 10, 15), (1, 6, 11, 12), (2, 7, 8, 13), (3, 4, 9, 14))
+
+
+def chacha_core(state):
+    """Run the 20 rounds of ChaCha on 16 words, without the final addition."""
+    mask = 0xFFFFFFFF
+    x = list(state)
+    for _ in range(10):
+        for a, b, c, d in CHACHA_ROUNDS:
+            x[a] = (x[a] + x[b]) & mask
+            value = x[d] ^ x[a]
+            x[d] = (value << 16 | value >> 16) & mask
+            x[c] = (x[c] + x[d]) & mask
+            value = x[b] ^ x[c]
+            x[b] = (value << 12 | value >> 20) & mask
+            x[a] = (x[a] + x[b]) & mask
+            value = x[d] ^ x[a]
+            x[d] = (value << 8 | value >> 24) & mask
+            x[c] = (x[c] + x[d]) & mask
+            value = x[b] ^ x[c]
+            x[b] = (value << 7 | value >> 25) & mask
+    return x
+
+
+class XChaCha20:
+    """XChaCha20 in plain Python, for when PyCryptodome isn't installed."""
+
+    def __init__(self, key, nonce):
+        words = struct.unpack("<8I4I", key + nonce[:16])
+        core = chacha_core(CHACHA_CONSTANTS + words)
+        subkey = core[:4] + core[12:]
+        self.state = list(CHACHA_CONSTANTS) + subkey + [0, 0] + list(struct.unpack("<2I", nonce[16:24]))
+        self.buffer = b""
+
+    def _block(self):
+        words = [(word + start) & 0xFFFFFFFF for word, start in zip(chacha_core(self.state), self.state)]
+        self.state[12] = (self.state[12] + 1) & 0xFFFFFFFF
+        if not self.state[12]:
+            self.state[13] = (self.state[13] + 1) & 0xFFFFFFFF
+        return struct.pack("<16I", *words)
+
+    def __call__(self, data):
+        stream = bytearray(self.buffer)
+        while len(stream) < len(data):
+            stream += self._block()
+        self.buffer = bytes(stream[len(data):])
+        size = len(data)
+        return (int.from_bytes(data, "little") ^ int.from_bytes(stream[:size], "little")).to_bytes(size, "little")
+
+
+def xchacha20(key, nonce):
+    """Return a function that decrypts the next bytes of an XChaCha20 stream."""
+    return FastChaCha20.new(key=key, nonce=nonce).decrypt if FastChaCha20 else XChaCha20(key, nonce)
+
+
+def nonce_for(base, start_offset, first_slice):
+    """Recreate the nonce of a chunk or a block from the base nonce, as InitCryptContext does."""
+    nonce = bytearray(base)
+    struct.pack_into("<q", nonce, 0, struct.unpack_from("<q", nonce, 0)[0] ^ start_offset)
+    struct.pack_into("<i", nonce, 8, struct.unpack_from("<i", nonce, 8)[0] ^ first_slice)
+    return bytes(nonce)
+
+
+Encryption = namedtuple("Encryption", "kdf salt iterations nonce test")
+
+
+def derive_key(encryption, password):
+    encoded = password.encode("utf-16-le", "surrogatepass")
+    if encryption.kdf == "blake2b":
+        # The fork passes Length(S) as the size, which counts characters, so only the first
+        # half of the UTF-16 text is hashed. It also ignores the iterations.
+        digest = hashlib.blake2b(encoded[:len(encoded) // 2], digest_size=64, key=encryption.salt).digest()
+        return digest[16:48]
+    return hashlib.pbkdf2_hmac("sha256", encoded, encryption.salt, encryption.iterations, 32)
+
+
+def block_header(view, pos, checksum=zlib.crc32):
     """Return the header size, stored size and compression flag of the block at pos.
 
     Stored sizes went from 32 to 64 bits in 6.7. Both are tried because the CRC
@@ -150,7 +305,7 @@ def block_header(view, pos):
         if len(raw) < end:
             continue
         crc = struct.unpack("<I", raw[:4])[0]
-        if zlib.crc32(raw[4:]) == crc:
+        if checksum(raw[4:]) == crc:
             return end, struct.unpack_from(size_format, raw, 4)[0], raw[end - 1]
     raise InnoError(f"no valid block header at {pos:#x}")
 
@@ -164,9 +319,12 @@ def lzma_filter(props, limit):
             "dict_size": max(min(dictionary, limit), 4096)}
 
 
-def read_block(view, pos):
-    """Read a compressed block, which is split in 4 KiB pieces that each carry a CRC."""
-    size_of_header, stored, compressed = block_header(view, pos)
+def read_block(view, pos, checksum=zlib.crc32, decrypt=None):
+    """Read a compressed block, which is split in 4 KiB pieces that each carry a CRC.
+
+    The CRCs cover the encrypted bytes, so decryption comes after them.
+    """
+    size_of_header, stored, compressed = block_header(view, pos, checksum)
     pos += size_of_header
     end = pos + stored
     if end > len(view):
@@ -176,9 +334,9 @@ def read_block(view, pos):
         crc = struct.unpack("<I", bytes(view[pos:pos + 4]))[0]
         pos += 4
         piece = bytes(view[pos:min(pos + BLOCK_CHUNK, end)])
-        if zlib.crc32(piece) != crc:
+        if checksum(piece) != crc:
             raise InnoError(f"bad CRC in block data at {pos:#x}")
-        data += piece
+        data += decrypt(piece) if decrypt else piece
         pos += len(piece)
     if compressed:
         decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_RAW,
@@ -190,31 +348,55 @@ def read_block(view, pos):
     return bytes(data), end
 
 
-def find_offsets(view):
-    """Find setup-0 and setup-1 through the offset table of the loader.
+Table = namedtuple("Table", "offset0 offset1 engine_offset engine_size engine_check checksum")
 
-    The table lives in a PE resource, but the same ID is a constant in the
-    loader code, so a hit only counts when the CRC of the table matches.
+
+def parse_table(raw):
+    """Read a table of either version, or return None for one of another size or version."""
+    version = struct.unpack_from("<I", raw, 12)[0]
+    if version == 1 and len(raw) >= 44:
+        engine_offset, engine_size, engine_check, offset0, offset1 = struct.unpack_from("<IIIII", raw, 20)
+        return Table(offset0, offset1, engine_offset, engine_size, engine_check, None), 44
+    if version == 2 and len(raw) >= 64:
+        engine_offset, engine_size, engine_check, offset0, offset1 = struct.unpack_from("<QIIQQ", raw, 24)
+        return Table(offset0, offset1, engine_offset, engine_size, engine_check, None), 64
+    return None
+
+
+def find_table(view):
+    """Find the offset table of the loader and the checksum this build uses.
+
+    The table lives in a PE resource, but the same ID is a constant in the loader
+    code, so a hit only counts when the checksum of the table matches. A table that
+    fails it yet points at setup data comes from a build that changed its checksum.
     """
+    modified = None
     pos = view.find(LDR_ID)
     while pos >= 0:
-        version = struct.unpack("<I", bytes(view[pos + 12:pos + 16]))[0]
-        if version == 1:
-            raw = bytes(view[pos:pos + 44])
-            if len(raw) == 44 and zlib.crc32(raw[:40]) == struct.unpack("<I", raw[40:])[0]:
-                return struct.unpack_from("<II", raw, 32)
-        elif version == 2:
-            raw = bytes(view[pos:pos + 64])
-            if len(raw) == 64 and zlib.crc32(raw[:60]) == struct.unpack("<I", raw[60:])[0]:
-                return struct.unpack_from("<QQ", raw, 40)
+        raw = bytes(view[pos:pos + 64])
+        parsed = parse_table(raw) if len(raw) >= 16 else None
+        if parsed:
+            table, size = parsed
+            stored = struct.unpack_from("<I", raw, size - 4)[0]
+            for checksum in (zlib.crc32, xxh32):
+                if checksum(raw[:size - 4]) == stored:
+                    return table._replace(checksum=checksum)
+            if SETUP_ID.match(bytes(view[table.offset0:table.offset0 + 64])):
+                modified = pos
         pos = view.find(LDR_ID, pos + 1)
+    if modified is not None:
+        raise InnoError(f"the offset table at {modified:#x} points to setup data but its checksum is neither "
+                        "CRC32 nor XXH32, so this is a modified build of Inno Setup")
     raise InnoError("no Inno Setup offset table found, this isn't an Inno Setup 5.1.5 or newer installer")
 
 
 class Installer:
-    def __init__(self, view):
+    def __init__(self, view, password=None):
         self.view = view
-        self.offset0, self.offset1 = find_offsets(view)
+        self.table = find_table(view)
+        self.offset0, self.offset1 = self.table.offset0, self.table.offset1
+        self.checksum = self.table.checksum
+        self.modified = self.checksum is xxh32
         raw_id = bytes(view[self.offset0:self.offset0 + 64])
         match = SETUP_ID.match(raw_id)
         if not match:
@@ -225,22 +407,68 @@ class Installer:
             if known < (6,):
                 raise InnoError(f"format {self.version} is older than 6.0, use innoextract")
             raise InnoError(f"format {self.version} isn't known, the newest here is 7.1.1")
-        self.layout = LAYOUTS[self.version]
+        if self.modified and self.version not in MODIFIED_LAYOUTS:
+            raise InnoError(f"modified build of format {self.version} isn't known, only "
+                            f"{', '.join(MODIFIED_LAYOUTS)} can be read")
+        self.layout = MODIFIED_LAYOUTS[self.version] if self.modified else LAYOUTS[self.version]
         self.encryption = "none"
+        self.scheme = None
+        self.key = None
         pos = self.offset0 + 64
         if self.layout.file_ansi:
             # The encryption header came in 6.5, together with the string that marks file_ansi.
             # It holds a CRC, the use of encryption, salt, iterations, nonce and password test.
             raw = bytes(view[pos:pos + 53])
-            if zlib.crc32(raw[4:]) != struct.unpack("<I", raw[:4])[0]:
+            if self.checksum(raw[4:]) != struct.unpack("<I", raw[:4])[0]:
                 raise InnoError("bad CRC in the encryption header")
             self.encryption = ENCRYPTION[raw[4]] if raw[4] < len(ENCRYPTION) else "unknown"
+            self.scheme = Encryption("pbkdf2", raw[5:21], struct.unpack_from("<i", raw, 21)[0], raw[25:49], raw[49:53])
             pos += 53
+        setup_cipher = locations_cipher = None
         if self.encryption == "full":
-            raise InnoError(f"format {self.version} with everything encrypted, nothing can be read without the password")
-        self.setup0, pos = read_block(view, pos)
-        self.location_data, _ = read_block(view, pos)
+            if password is None:
+                raise InnoError(f"format {self.version} with everything encrypted, nothing can be read "
+                                "without --password")
+            self._unlock(password)
+            setup_cipher = self._special_cipher(SLICE_BLOCK_SETUP)
+            locations_cipher = self._special_cipher(SLICE_BLOCK_LOCATIONS)
+        self.setup0, pos = read_block(view, pos, self.checksum, setup_cipher)
+        self.location_data, _ = read_block(view, pos, self.checksum, locations_cipher)
         self._parse()
+        if not self.scheme and tuple(int(part) for part in self.version.split(".")) >= ENCRYPTED_FROM:
+            self.scheme = self._header_scheme()
+        if password is not None and self.encryption == "files":
+            self._unlock(password)
+
+    def _header_scheme(self):
+        """Read the encryption fields that 6.4 keeps in the header."""
+        fixed = self.header.fixed
+        pos = HEADER_PASSWORD_TEST
+        salt_size = 64 if self.modified else 16
+        test = fixed[pos:pos + 4]
+        salt = fixed[pos + 4:pos + 4 + salt_size]
+        iterations = struct.unpack_from("<i", fixed, pos + 4 + salt_size)[0]
+        nonce = fixed[pos + 8 + salt_size:pos + 32 + salt_size]
+        return Encryption("blake2b" if self.modified else "pbkdf2", salt, iterations, nonce, test)
+
+    def _special_cipher(self, first_slice):
+        return xchacha20(self.key, nonce_for(self.scheme.nonce, 0, first_slice))
+
+    def _unlock(self, password):
+        if not self.scheme:
+            raise InnoError(f"format {self.version} uses ARC4, decrypting it needs innoextract")
+        if self.scheme.kdf == "pbkdf2" and not 1 <= self.scheme.iterations <= 1 << 24:
+            raise InnoError(f"{self.scheme.iterations} KDF iterations make no sense, the layout doesn't fit this file")
+        self.key = derive_key(self.scheme, password)
+        if self._special_cipher(SLICE_PASSWORD_TEST)(bytes(4)) != self.scheme.test:
+            self.key = None
+            raise InnoError("wrong password")
+
+    def chunk_cipher(self, first_slice, start_offset):
+        """Return the decryption of a chunk. StartOffset was a signed 32 bits before 6.7."""
+        if self.layout.location_fixed != 89 and start_offset >= 1 << 31:
+            start_offset -= 1 << 32
+        return xchacha20(self.key, nonce_for(self.scheme.nonce, start_offset, first_slice))
 
     def _parse(self):
         layout = self.layout
@@ -257,9 +485,10 @@ class Installer:
         if any(count < 0 or count > len(self.setup0) for count in self.counts.values()):
             raise InnoError("entry counts make no sense, the layout doesn't fit this file")
         method = self.header.fixed[layout.compress_offset]
-        if method >= len(COMPRESSION):
+        methods = MODIFIED_COMPRESSION if self.modified else COMPRESSION
+        if method >= len(methods):
             raise InnoError("unknown compression method, the layout doesn't fit this file")
-        self.compression = COMPRESSION[method]
+        self.compression = methods[method]
         self.languages = read_entries(reader, self.counts["languages"], layout.language_strings, 4, layout.language_fixed)
         read_entries(reader, self.counts["messages"], 2, 0, 4)
         read_entries(reader, self.counts["permissions"], 0, 1, 0)
@@ -289,8 +518,8 @@ class Installer:
             raise InnoError(f"{len(self.location_data)} bytes of file locations for {count} entries of {size}, "
                             "the layout doesn't fit this file")
         wide_start = size == 89
-        old_flags = size in (74, 75, 87)
-        digest_size = 20 if size in (74, 75) else 32
+        old_flags = size in (71, 74, 75, 87)
+        digest_size, hash_name = {71: (16, "xxh128"), 74: (20, "sha1"), 75: (20, "sha1")}.get(size, (32, "sha256"))
         call_bit, encrypted_bit, compressed_bit = (4, 6, 7) if old_flags else (2, 3, 4)
         flags_size = 2 if old_flags else 1
         locations = []
@@ -305,10 +534,12 @@ class Installer:
                 raise InnoError(f"negative size or offset in file location {index}")
             pos += 24
             digest = raw[pos:pos + digest_size]
+            if hash_name == "xxh128":
+                digest = digest[::-1]  # stored as a little-endian number, printed the way xxhash does
             pos += digest_size + 16  # timestamp and file version
             flags = int.from_bytes(raw[pos:pos + flags_size], "little")
             locations.append(Location(index, first, last, start, suboffset, length, compressed_size, digest,
-                                      "sha1" if digest_size == 20 else "sha256", bool(flags >> call_bit & 1),
+                                      hash_name, bool(flags >> call_bit & 1),
                                       bool(flags >> encrypted_bit & 1), bool(flags >> compressed_bit & 1)))
         if self.encryption == "none" and any(location.encrypted for location in locations):
             self.encryption = "files"
@@ -329,7 +560,7 @@ class Installer:
 class ChunkStream:
     """Decompress one chunk of file data on demand, which can be gigabytes when solid."""
 
-    def __init__(self, view, location, method, total):
+    def __init__(self, view, location, method, total, decrypt=None):
         pos = location.start_offset
         if bytes(view[pos:pos + 4]) != CHUNK_ID:
             raise InnoError(f"no chunk at {pos:#x}")
@@ -339,16 +570,15 @@ class ChunkStream:
         self.end = pos + location.compressed_size
         if self.end > len(view):
             raise InnoError("chunk runs past the end of the file")
+        self.decrypt = decrypt
         self.tail = b""
         self.method = method if location.compressed else "stored"
         limit = min(max(total, 1 << 16), MAX_DICTIONARY)
         if self.method == "lzma":
-            props = bytes(view[pos:pos + 5])
-            self.pos += 5
+            props = self._input(5)
             self.decoder = lzma.LZMADecompressor(format=lzma.FORMAT_RAW, filters=[lzma_filter(props, limit)])
         elif self.method == "lzma2":
-            prop = view[pos]
-            self.pos += 1
+            prop = self._input(1)[0]
             dictionary = 0xFFFFFFFF if prop == 40 else (2 | (prop & 1)) << (prop // 2 + 11)
             self.decoder = lzma.LZMADecompressor(format=lzma.FORMAT_RAW, filters=[
                 {"id": lzma.FILTER_LZMA2, "dict_size": max(min(dictionary, limit), 4096)}])
@@ -360,7 +590,7 @@ class ChunkStream:
     def _input(self, size=1 << 20):
         piece = bytes(self.view[self.pos:min(self.pos + size, self.end)])
         self.pos += len(piece)
-        return piece
+        return self.decrypt(piece) if self.decrypt else piece
 
     def read(self, size):
         out = bytearray()
@@ -441,9 +671,16 @@ def unique_path(path, digest, taken):
     return candidate
 
 
+def new_digest(name):
+    """Return a hash object, or None for XXH128 when xxhash isn't installed."""
+    if name == "xxh128":
+        return xxhash.xxh128() if xxhash else None
+    return hashlib.new(name)
+
+
 def extract_location(stream, location, targets):
-    """Copy one file out of the chunk, restoring the bytes, and verify its hash."""
-    digest = hashlib.new(location.hash_name)
+    """Copy one file out of the chunk, restoring the bytes, and verify its hash when it can."""
+    digest = new_digest(location.hash_name)
     os.makedirs(os.path.dirname(targets[0]), exist_ok=True)
     # mkstemp doesn't follow a link left in the output, which a fixed name would.
     descriptor, partial = tempfile.mkstemp(dir=os.path.dirname(targets[0]), suffix=".part")
@@ -456,10 +693,11 @@ def extract_location(stream, location, targets):
                 if location.call_filter:
                     undo_call_filter(buffer, address)
                     address = (address + len(buffer)) & 0xFFFFFFFF
-                digest.update(buffer)
+                if digest:
+                    digest.update(buffer)
                 output.write(buffer)
                 left -= len(buffer)
-        if digest.digest() != location.digest:
+        if digest and digest.digest() != location.digest:
             return False
         os.chmod(partial, 0o644)
         os.replace(partial, targets[0])
@@ -502,6 +740,8 @@ def command_info(installer, args):
     header = installer.header.strings
     locations = installer.locations
     print(f"format\t{installer.version}")
+    if installer.modified:
+        print("build\tmodified, XXH32 checksums instead of CRC32")
     print(f"app\t{escape(header[APP_NAME])}")
     print(f"version\t{escape(header[APP_VERSION])}")
     print(f"publisher\t{escape(header[APP_PUBLISHER])}")
@@ -634,6 +874,288 @@ def command_code(installer, args):
                                     if re.search(r"[a-z.\\/:]", text) and not IMPORT.match(text.encode("latin1", "replace"))))
 
 
+IFPS_ID = b"IFPS"
+IFPS_PROC_EXTERNAL, IFPS_PROC_EXPORTED, IFPS_PROC_ATTRIBUTES = 1, 2, 4
+IFPS_EXPORTED_TYPE = 0x80
+IFPS_LOCAL_BASE = 0x60000000
+IFPS_TYPE_NAMES = {0: "return", 1: "u8", 2: "s8", 3: "u16", 4: "s16", 5: "u32", 6: "s32", 7: "single", 8: "double",
+                   9: "extended", 10: "string", 11: "record", 12: "array", 13: "pointer", 14: "pchar", 15: "resource",
+                   16: "variant", 17: "s64", 18: "char", 19: "widestring", 20: "widechar", 21: "procptr",
+                   22: "staticarray", 23: "set", 24: "currency", 25: "class", 26: "interface", 27: "notification",
+                   28: "unicodestring"}
+IFPS_CALC = ("+", "-", "*", "/", "mod", "shl", "shr", "and", "or", "xor")
+IFPS_COMPARE = (">=", "<=", ">", "<", "<>", "=", "in", "is")
+IFPS_DECLARATION = re.compile(rb"(?:dll|class|intf):[\x20-\x7e]{1,200}(?:\x00[\x20-\x7e]{1,200})?")
+
+
+class Script:
+    """A compiled PascalScript, the bytecode of the [Code] section."""
+
+    def __init__(self, code):
+        self.reader = reader = Reader(code)
+        if reader.take(4) != IFPS_ID:
+            raise InnoError("not a compiled script")
+        self.build = reader.u32()
+        counts = [reader.u32() for _ in range(3)]
+        self.main = reader.u32()
+        reader.u32()  # size of the import table
+        if any(count > len(code) for count in counts):
+            raise InnoError("entry counts make no sense for a compiled script")
+        self.types = [self._type() for _ in range(counts[0])]
+        self.procs = [self._proc() for _ in range(counts[1])]
+        self.variables = [self._variable() for _ in range(counts[2])]
+
+    def _name(self):
+        return self.reader.take(self.reader.u32()).decode("latin1")
+
+    def _attributes(self):
+        if self.build < 21:
+            return
+        for _ in range(self.reader.u32()):
+            self._name()
+            for _ in range(self.reader.u32()):
+                self._immediate(self.reader.u32())
+
+    def _type(self):
+        reader = self.reader
+        raw = reader.u8()
+        base = raw & ~IFPS_EXPORTED_TYPE
+        detail = ""
+        if base in (21, 25):
+            detail = self._name()
+        elif base == 26:
+            reader.take(16)
+        elif base == 23:
+            detail = str(reader.u32())
+        elif base == 22:
+            detail = " ".join(str(reader.u32()) for _ in range(3 if self.build >= 21 else 2))
+        elif base == 12:
+            detail = str(reader.u32())
+        elif base == 11:
+            detail = " ".join(str(reader.u32()) for _ in range(reader.u32()))
+        name = self._name() if raw & IFPS_EXPORTED_TYPE else ""
+        self._attributes()
+        return base, name, detail
+
+    def _proc(self):
+        reader = self.reader
+        flags = reader.u8()
+        name, declaration, offset, size = "", b"", None, None
+        if flags & IFPS_PROC_EXTERNAL:
+            name = reader.take(reader.u8()).decode("latin1")
+            if flags & IFPS_PROC_EXPORTED:
+                declaration = reader.take(reader.u32())
+        else:
+            offset, size = reader.u32(), reader.u32()
+            if flags & IFPS_PROC_EXPORTED:
+                name = self._name()
+                declaration = reader.take(reader.u32())
+        if flags & IFPS_PROC_ATTRIBUTES:
+            self._attributes()
+        return bool(flags & IFPS_PROC_EXTERNAL), name, declaration, offset, size
+
+    def _variable(self):
+        kind = self.reader.u32()
+        flags = self.reader.u8()
+        return kind, self._name() if flags & 1 else ""
+
+    def proc_name(self, index):
+        if index >= len(self.procs):
+            raise InnoError(f"call to procedure {index}, which doesn't exist")
+        external, name, declaration, _, _ = self.procs[index]
+        if external and not name:
+            match = IFPS_DECLARATION.match(declaration)
+            if match:
+                return escape(match.group().replace(b"\0", b" ").decode("latin1"))
+        return escape(name) or f"proc_{index}"
+
+    def _immediate(self, type_index):
+        if type_index >= len(self.types):
+            raise InnoError(f"constant of type {type_index}, which doesn't exist")
+        reader = self.reader
+        base, _, detail = self.types[type_index]
+        if base in (1, 2):
+            return str(reader.u8())
+        if base == 18:
+            return repr(escape(chr(reader.u8())))
+        if base in (3, 4):
+            return str(struct.unpack("<H", reader.take(2))[0])
+        if base == 20:
+            return repr(escape(reader.take(2).decode("utf-16-le", "replace")))
+        if base in (5, 6):
+            return str(reader.i32())
+        if base == 17:
+            return str(struct.unpack("<q", reader.take(8))[0])
+        if base == 7:
+            return str(struct.unpack("<f", reader.take(4))[0])
+        if base in (8, 24):
+            return str(struct.unpack("<d", reader.take(8))[0])
+        if base == 9:
+            return reader.take(10).hex()
+        if base in (10, 14):
+            return f'"{escape(reader.take(reader.u32()).decode("latin1"))}"'
+        if base in (19, 28):
+            return f'"{escape(reader.take(reader.u32() * 2).decode("utf-16-le", "replace"))}"'
+        if base == 23:
+            return reader.take((int(detail) + 7) // 8).hex()
+        if base == 21:
+            return f"proc_{reader.u32()}"
+        raise InnoError(f"constant of type {IFPS_TYPE_NAMES.get(base, base)} isn't known")
+
+    @staticmethod
+    def _variable_name(number):
+        if number < 0x40000000:
+            return f"G{number}"
+        return f"L{number - IFPS_LOCAL_BASE}"
+
+    def _operand(self):
+        reader = self.reader
+        kind = reader.u8()
+        if kind == 0:
+            return self._variable_name(reader.u32())
+        if kind == 1:
+            return "#" + self._immediate(reader.u32())
+        if kind == 2:
+            base = reader.u32()
+            return f"{self._variable_name(base)}[{reader.u32()}]"
+        if kind == 3:
+            base = reader.u32()
+            return f"{self._variable_name(base)}[{self._variable_name(reader.u32())}]"
+        raise InnoError(f"operand of kind {kind} isn't known")
+
+    def _type_name(self, index):
+        if index >= len(self.types):
+            return f"type_{index}"
+        base, name, _ = self.types[index]
+        return escape(name) or IFPS_TYPE_NAMES.get(base, str(base))
+
+    def _instruction(self):
+        """Decode the instruction at the reader and return its text, which is empty for a NOP."""
+        reader = self.reader
+        op = reader.u8()
+        operand = self._operand
+        if op == 0:
+            target = operand()
+            return f"{target} := {operand()}"
+        if op == 1:
+            kind = reader.u8()
+            target = operand()
+            return f"{target} {self._table(IFPS_CALC, kind)}= {operand()}"
+        if op in (2, 3):
+            return f"{'push' if op == 2 else 'pushvar'} {operand()}"
+        if op == 4:
+            return "pop"
+        if op == 5:
+            return f"call {self.proc_name(reader.u32())}"
+        if op == 6:
+            jump = reader.i32()
+            return f"goto {reader.pos + jump:#x}"
+        if op in (7, 8):
+            jump = reader.i32()
+            condition = operand()
+            return f"{'if' if op == 7 else 'ifnot'} {condition} goto {reader.pos + jump:#x}"
+        if op == 9:
+            return "ret"
+        if op == 10:
+            target = operand()
+            return f"settype {target} {self._type_name(reader.u32())}"
+        if op == 11:
+            return f"pushtype {self._type_name(reader.u32())}"
+        if op == 12:
+            kind = reader.u8()
+            target = operand()
+            left = operand()
+            return f"{target} := {left} {self._table(IFPS_COMPARE, kind)} {operand()}"
+        if op == 13:
+            return f"callvar {operand()}"
+        if op == 14:
+            target = operand()
+            return f"setpointer {target} {operand()}"
+        if op in (15, 16, 21, 23, 24):
+            return f"{ {15: 'boolnot', 16: 'negate', 21: 'intnot', 23: 'inc', 24: 'dec'}[op]} {operand()}"
+        if op == 17:
+            target = operand()
+            return f"setflag {target} {reader.u8()}"
+        if op == 18:
+            jump = reader.i32()
+            return f"flaggoto {reader.pos + jump:#x}"
+        if op == 19:
+            return "pushexception " + " ".join(str(reader.u32()) for _ in range(4))
+        if op == 20:
+            return f"popexception {reader.u8()}"
+        if op == 22:
+            target = operand()
+            return f"setcopypointer {target} {operand()}"
+        if op == 255:
+            return ""
+        raise InnoError(f"opcode {op} isn't known")
+
+    @staticmethod
+    def _table(names, index):
+        return names[index] if index < len(names) else f"op_{index}"
+
+    def disassemble(self, index):
+        """Yield the lines of a procedure and stop with a note at the first bad instruction."""
+        _, _, _, offset, size = self.procs[index]
+        reader = self.reader
+        reader.pos = offset
+        end = offset + size
+        while reader.pos < end:
+            start = reader.pos
+            try:
+                line = self._instruction()
+            except InnoError as error:
+                yield f"{start:#06x}\tcan't decode further: {error}"
+                return
+            if line:
+                yield f"{start:#06x}\t{line}"
+
+
+def command_disasm(installer, args):
+    code = installer.code
+    if not code:
+        print("no [Code] section")
+        return 0
+    if code[:4] != IFPS_ID:
+        raise InnoError("not a compiled script, nothing to disassemble")
+    script = Script(code)
+    print(f"build\t{script.build}")
+    print(f"procedures\t{len(script.procs)}, main is {script.proc_name(script.main) if script.procs else 'absent'}")
+    # This list is what the script can reach. Anything absent from it can't run.
+    print_section("External", [f"{index}\t{script.proc_name(index)}" for index, proc in enumerate(script.procs) if proc[0]])
+    print_section("Variables", [f"G{index}\t{script._type_name(kind)}\t{escape(name)}".rstrip("\t")
+                                for index, (kind, name) in enumerate(script.variables)])
+    found = False
+    for index, proc in enumerate(script.procs):
+        if proc[0] or (args.proc and proc[1].lower() != args.proc.lower()):
+            continue
+        found = True
+        print(f"[Procedure {index}]\t{script.proc_name(index)}")
+        for line in script.disassemble(index):
+            print(line)
+        print()
+    if args.proc and not found:
+        raise InnoError(f"no procedure named {escape(args.proc)}")
+    return 0
+
+
+def command_engine(installer, args):
+    table = installer.table
+    data, _ = read_block(installer.view, table.engine_offset, installer.checksum)
+    engine = bytearray(data)
+    # The whole file goes through the filter at once, unlike the 64 KiB blocks of a data file.
+    undo_call_filter(engine, 0)
+    verified = installer.checksum(engine) == table.engine_check
+    print(f"size\t{len(engine)} of {table.engine_size} expected")
+    print(f"sha256\t{hashlib.sha256(engine).hexdigest()}")
+    print(f"checksum\t{'matches' if verified else 'differs'}")
+    if not verified or len(engine) != table.engine_size:
+        raise InnoError("the engine doesn't match the checksum in the offset table, nothing was written")
+    with open(args.out, "wb") as output:
+        output.write(engine)
+    return 0
+
+
 def command_extract(installer, args):
     if not installer.offset1:
         raise InnoError("the data isn't inside the EXE, this needs setup-1.bin")
@@ -662,48 +1184,67 @@ def command_extract(installer, args):
     for index in wanted:
         location = installer.locations[index]
         chunks.setdefault((location.first_slice, location.start_offset), []).append(location)
-    written = skipped = failed = 0
+    written = skipped = failed = unverified = 0
     for key in sorted(chunks):
         members = sorted(chunks[key], key=lambda location: location.chunk_suboffset)
-        if members[0].encrypted:
+        encrypted = members[0].encrypted
+        if encrypted and installer.key is None:
             skipped += len(members)
             for location in members:
                 print(f"encrypted, skipped\t{escape(wanted[location.index][0])}", file=sys.stderr)
             continue
         total = max(location.chunk_suboffset + location.size for location in members)
         base = members[0]._replace(start_offset=installer.offset1 + key[1])
-        stream = ChunkStream(installer.view, base, installer.compression, total)
+
+        def open_stream():
+            decrypt = installer.chunk_cipher(*key) if encrypted else None
+            return ChunkStream(installer.view, base, installer.compression, total, decrypt)
+
+        stream = open_stream()
         position = 0
         for location in members:
             if location.chunk_suboffset < position:
-                stream = ChunkStream(installer.view, base, installer.compression, total)
+                stream = open_stream()
                 position = 0
             while position < location.chunk_suboffset:
                 position += len(stream.read(min(location.chunk_suboffset - position, 1 << 20)))
             if extract_location(stream, location, wanted[location.index]):
                 written += len(wanted[location.index])
+                if new_digest(location.hash_name) is None:
+                    unverified += len(wanted[location.index])
             else:
                 failed += 1
                 print(f"hash mismatch, removed\t{escape(wanted[location.index][0])}", file=sys.stderr)
             position += location.size
-    print(f"{written} files written to {escape(output_root)}, {skipped} skipped, {failed} failed")
-    return 1 if failed or skipped else 0
+    note = f", {unverified} not verified, XXH128 needs the xxhash module" if unverified else ""
+    print(f"{written} files written to {escape(output_root)}, {skipped} skipped, {failed} failed{note}")
+    return 1 if failed or skipped or unverified else 0
 
 
 def main():
     parser = argparse.ArgumentParser(description="Read Inno Setup 6.0 to 7.1 installers without running them.")
     commands = parser.add_subparsers(dest="command", required=True)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--password", help="decrypt formats 6.4 and newer with this password")
     for name, handler, help_text in (("info", command_info, "format, application and storage"),
                                      ("list", command_list, "files with size, hash and destination"),
                                      ("actions", command_actions, "what the installer does besides copying files")):
-        command = commands.add_parser(name, help=help_text)
+        command = commands.add_parser(name, help=help_text, parents=[common])
         command.add_argument("file")
         command.set_defaults(handler=handler)
-    command = commands.add_parser("code", help="names and strings in the compiled [Code] script")
+    command = commands.add_parser("code", help="names and strings in the compiled [Code] script", parents=[common])
     command.add_argument("file")
     command.add_argument("--dump", help="also write the compiled script to this file")
     command.set_defaults(handler=command_code)
-    command = commands.add_parser("extract", help="write the embedded files and verify their hashes")
+    command = commands.add_parser("disasm", help="disassemble the compiled [Code] script", parents=[common])
+    command.add_argument("file")
+    command.add_argument("--proc", help="only this procedure, any case")
+    command.set_defaults(handler=command_disasm)
+    command = commands.add_parser("engine", help="write the setup engine stored in the installer", parents=[common])
+    command.add_argument("file")
+    command.add_argument("out")
+    command.set_defaults(handler=command_engine)
+    command = commands.add_parser("extract", help="write the embedded files and verify their hashes", parents=[common])
     command.add_argument("file")
     command.add_argument("dir")
     command.add_argument("--only", action="append", help="glob on the destination, any case, can repeat")
@@ -714,7 +1255,7 @@ def main():
             if os.fstat(source.fileno()).st_size == 0:
                 raise InnoError("empty file")
             with mmap.mmap(source.fileno(), 0, access=mmap.ACCESS_READ) as view:
-                return args.handler(Installer(view), args) or 0
+                return args.handler(Installer(view, args.password), args) or 0
     except MemoryError:
         print("inno-unpack: not enough memory for this installer", file=sys.stderr)
         return 2
