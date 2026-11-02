@@ -1,0 +1,706 @@
+#!/usr/bin/env python3
+"""Read Inno Setup installers from version 6.0 to 7.1 without running them.
+
+  inno-unpack info FILE
+  inno-unpack list FILE
+  inno-unpack actions FILE
+  inno-unpack code FILE [--dump OUT]
+  inno-unpack extract FILE DIR [--only GLOB]
+
+`info` prints the format version, the application and how the data is stored.
+`list` prints size, hash and destination of each file. `actions` prints what the
+installer does besides copying files, which means the commands it runs, registry
+and INI changes, deletions, shortcuts, DLLs it registers and files it fetches. `code`
+lists the names and strings found in the compiled [Code] script. It scans the
+bytecode instead of decompiling it, so it says what the script can call, not
+when. `extract` writes the embedded files under DIR and checks each one against
+the hash stored in the installer, keeping only the ones that match.
+
+Older installers need innoextract. Nothing here decrypts, so an installer
+encrypted in full can't be read and one with encrypted files can be listed but
+not extracted. The data has to be inside the EXE, so installers that ship
+setup-1.bin next to it can't be extracted either.
+
+Everything in an installer is treated as untrusted. Strings are escaped before
+printing and destinations can't leave DIR.
+"""
+import argparse
+import bz2
+import fnmatch
+import hashlib
+import lzma
+import mmap
+import os
+import re
+import shutil
+import struct
+import sys
+import zlib
+from collections import namedtuple
+
+LDR_ID = b"rDlPtS\xcd\xe6\xd7\x7b\x0b\x2a"
+SETUP_ID = re.compile(rb"Inno Setup Setup Data \(([0-9.]+)\)")
+CHUNK_ID = b"zlb\x1a"
+BLOCK_CHUNK = 4096
+FILTER_BLOCK = 0x10000  # has to match the buffer Setup decompresses with
+COMPRESSION = ("stored", "zip", "bzip2", "lzma", "lzma2")
+ENCRYPTION = ("none", "files", "full")
+# HKA is HKEY_AUTO, which Setup turns into HKLM or HKCU depending on the install mode.
+REGISTRY_ROOTS = {1: "HKA", 0x80000000: "HKCR", 0x80000001: "HKCU", 0x80000002: "HKLM", 0x80000003: "HKU",
+                  0x80000005: "HKCC"}
+REG_TYPES = ("none", "string", "expandstring", "dword", "binary", "multistring", "qword")
+DELETE_TYPES = ("files", "filesandordirs", "dirifempty")
+WINDOWS_DEVICES = {"CON", "PRN", "AUX", "NUL"} | {f"{d}{i}" for d in ("COM", "LPT") for i in range(1, 10)}
+
+# Each row comes from the packed records in Shared.Struct.pas of the release
+# that introduced the ID. Fixed sizes leave out the strings, which are stored
+# first with a length prefix. Releases that kept the format kept the ID, so
+# 6.1.0 also covers 6.2, 6.7.0 covers up to 6.7.4 and 7.0.0.3 covers up to 7.1.0.
+# 6.4.0 only appeared in a prerelease.
+Layout = namedtuple("Layout", "header_strings header_fixed compress_offset language_strings language_fixed "
+                              "component_fixed task_fixed file_strings file_ansi file_fixed icon_fixed "
+                              "registry_fixed run_strings run_fixed location_fixed")
+LAYOUTS = {
+    "6.0.0": Layout(30, 167, 148, 6, 21, 42, 26, 10, 0, 43, 32, 29, 13, 27, 74),
+    "6.1.0": Layout(30, 167, 148, 6, 21, 42, 26, 10, 0, 43, 48, 29, 13, 27, 74),
+    "6.3.0": Layout(32, 166, 148, 6, 21, 42, 26, 10, 0, 43, 48, 29, 13, 27, 75),
+    "6.4.0": Layout(32, 177, 160, 6, 21, 42, 26, 10, 0, 43, 48, 29, 13, 27, 87),
+    "6.4.0.1": Layout(32, 177, 160, 6, 21, 42, 26, 10, 0, 43, 48, 29, 13, 27, 87),
+    "6.4.2": Layout(33, 177, 160, 6, 21, 42, 26, 10, 0, 43, 48, 29, 13, 27, 87),
+    "6.4.3": Layout(33, 177, 160, 6, 21, 42, 26, 10, 0, 43, 48, 29, 13, 27, 85),
+    "6.5.0": Layout(34, 133, 116, 6, 21, 42, 26, 15, 1, 77, 48, 29, 13, 27, 85),
+    "6.5.2": Layout(34, 141, 124, 6, 21, 42, 26, 15, 1, 77, 48, 29, 13, 27, 89),
+    "6.6.0": Layout(34, 149, 132, 4, 19, 42, 26, 15, 1, 77, 48, 29, 13, 27, 89),
+    "6.6.1": Layout(34, 150, 133, 4, 19, 42, 26, 15, 1, 77, 48, 29, 13, 27, 89),
+    "6.7.0": Layout(39, 162, 143, 4, 19, 39, 23, 15, 1, 80, 48, 29, 13, 27, 89),
+    "7.0.0.1": Layout(39, 162, 143, 4, 19, 39, 23, 15, 1, 80, 48, 29, 14, 27, 89),
+    "7.0.0.3": Layout(39, 166, 147, 4, 19, 39, 23, 15, 1, 81, 48, 30, 14, 28, 89),
+    "7.1.1": Layout(38, 166, 147, 4, 19, 39, 23, 15, 1, 81, 48, 30, 14, 28, 89),
+}
+HEADER_ANSI = 4
+
+# Strings the tool reads, by position in the record.
+APP_NAME, APP_VER_NAME, APP_ID, APP_PUBLISHER, APP_VERSION = 0, 1, 2, 4, 9
+LICENSE, CODE = 0, 3
+FILE_SOURCE, FILE_DEST, FILE_COMPONENTS, FILE_TASKS, FILE_LANGUAGES, FILE_CHECK = 0, 1, 4, 5, 6, 7
+RUN_NAME, RUN_PARAMS, RUN_DIR, RUN_VERB, RUN_COMPONENTS, RUN_TASKS, RUN_LANGUAGES, RUN_CHECK = 0, 1, 2, 5, 7, 8, 9, 10
+REG_SUBKEY, REG_VALUE_NAME, REG_VALUE_DATA, REG_COMPONENTS, REG_TASKS, REG_LANGUAGES, REG_CHECK = 0, 1, 2, 3, 4, 5, 6
+RUN_SHELLEXEC, RUN_POSTINSTALL, RUN_NOWAIT = 1, 4, 1
+FILE_REGSERVER, FILE_UNINSTALLER = 1 << 4, 1
+
+
+class InnoError(Exception):
+    pass
+
+
+class Reader:
+    def __init__(self, data):
+        self.data = data
+        self.pos = 0
+
+    def take(self, n):
+        if n < 0 or self.pos + n > len(self.data):
+            raise InnoError(f"read of {n} bytes at {self.pos} runs past the end, the layout doesn't fit this file")
+        chunk = self.data[self.pos:self.pos + n]
+        self.pos += n
+        return chunk
+
+    def u32(self):
+        return struct.unpack("<I", self.take(4))[0]
+
+    def text(self):
+        raw = self.take(self.u32())
+        if len(raw) % 2:
+            raise InnoError(f"odd UTF-16 length before {self.pos}, the layout doesn't fit this file")
+        return raw.decode("utf-16-le", "replace")
+
+    def blob(self):
+        return self.take(self.u32())
+
+
+Entry = namedtuple("Entry", "strings ansi fixed")
+Location = namedtuple("Location", "index first_slice last_slice start_offset chunk_suboffset size compressed_size "
+                                  "digest hash_name call_filter encrypted compressed")
+
+
+def read_entries(reader, count, strings, ansi, fixed):
+    entries = []
+    for _ in range(count):
+        texts = [reader.text() for _ in range(strings)]
+        blobs = [reader.blob() for _ in range(ansi)]
+        entries.append(Entry(texts, blobs, reader.take(fixed)))
+    return entries
+
+
+def block_header(view, pos):
+    """Return the header size, stored size and compression flag of the block at pos.
+
+    Stored sizes went from 32 to 64 bits in 6.7. Both are tried because the CRC
+    of the header tells them apart.
+    """
+    for size_format, end in (("<I", 9), ("<Q", 13)):
+        raw = bytes(view[pos:pos + end])
+        if len(raw) < end:
+            continue
+        crc = struct.unpack("<I", raw[:4])[0]
+        if zlib.crc32(raw[4:]) == crc:
+            return end, struct.unpack_from(size_format, raw, 4)[0], raw[end - 1]
+    raise InnoError(f"no valid block header at {pos:#x}")
+
+
+def lzma_filter(props, limit):
+    """Filter for an LZMA1 stream. liblzma allocates the whole dictionary, so limit caps it."""
+    lc = props[0] % 9
+    rest = props[0] // 9
+    dictionary = struct.unpack("<I", props[1:5])[0]
+    return {"id": lzma.FILTER_LZMA1, "lc": lc, "lp": rest % 5, "pb": rest // 5,
+            "dict_size": max(min(dictionary, limit), 4096)}
+
+
+def read_block(view, pos):
+    """Read a compressed block, which is split in 4 KiB pieces that each carry a CRC."""
+    size_of_header, stored, compressed = block_header(view, pos)
+    pos += size_of_header
+    end = pos + stored
+    if end > len(view):
+        raise InnoError("block runs past the end of the file")
+    data = bytearray()
+    while pos < end:
+        crc = struct.unpack("<I", bytes(view[pos:pos + 4]))[0]
+        pos += 4
+        piece = bytes(view[pos:min(pos + BLOCK_CHUNK, end)])
+        if zlib.crc32(piece) != crc:
+            raise InnoError(f"bad CRC in block data at {pos:#x}")
+        data += piece
+        pos += len(piece)
+    if compressed:
+        decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_RAW,
+                                             filters=[lzma_filter(data[:5], 1 << 30)])
+        return decompressor.decompress(bytes(data[5:])), end
+    return bytes(data), end
+
+
+def find_offsets(view):
+    """Find setup-0 and setup-1 through the offset table of the loader.
+
+    The table lives in a PE resource, but the same ID is a constant in the
+    loader code, so a hit only counts when the CRC of the table matches.
+    """
+    pos = view.find(LDR_ID)
+    while pos >= 0:
+        version = struct.unpack("<I", bytes(view[pos + 12:pos + 16]))[0]
+        if version == 1:
+            raw = bytes(view[pos:pos + 44])
+            if len(raw) == 44 and zlib.crc32(raw[:40]) == struct.unpack("<I", raw[40:])[0]:
+                return struct.unpack_from("<II", raw, 32)
+        elif version == 2:
+            raw = bytes(view[pos:pos + 64])
+            if len(raw) == 64 and zlib.crc32(raw[:60]) == struct.unpack("<I", raw[60:])[0]:
+                return struct.unpack_from("<QQ", raw, 40)
+        pos = view.find(LDR_ID, pos + 1)
+    raise InnoError("no Inno Setup offset table found, this isn't an Inno Setup 5.1.5 or newer installer")
+
+
+class Installer:
+    def __init__(self, view):
+        self.view = view
+        self.offset0, self.offset1 = find_offsets(view)
+        raw_id = bytes(view[self.offset0:self.offset0 + 64])
+        match = SETUP_ID.match(raw_id)
+        if not match:
+            raise InnoError(f"no setup data at {self.offset0:#x}, the installer may use a modified format")
+        self.version = match.group(1).decode()
+        if self.version not in LAYOUTS:
+            known = tuple(int(part) for part in self.version.split("."))
+            if known < (6,):
+                raise InnoError(f"format {self.version} is older than 6.0, use innoextract")
+            raise InnoError(f"format {self.version} isn't known, the newest here is 7.1.1")
+        self.layout = LAYOUTS[self.version]
+        self.encryption = "none"
+        pos = self.offset0 + 64
+        if self.layout.file_ansi:
+            # The encryption header came in 6.5, together with the string that marks file_ansi.
+            # It holds a CRC, the use of encryption, salt, iterations, nonce and password test.
+            raw = bytes(view[pos:pos + 53])
+            if zlib.crc32(raw[4:]) != struct.unpack("<I", raw[:4])[0]:
+                raise InnoError("bad CRC in the encryption header")
+            self.encryption = ENCRYPTION[raw[4]] if raw[4] < len(ENCRYPTION) else "unknown"
+            pos += 53
+        if self.encryption == "full":
+            raise InnoError(f"format {self.version} with everything encrypted, nothing can be read without the password")
+        self.setup0, pos = read_block(view, pos)
+        self.location_data, _ = read_block(view, pos)
+        self._parse()
+
+    def _parse(self):
+        layout = self.layout
+        reader = Reader(self.setup0)
+        self.header = read_entries(reader, 1, layout.header_strings, HEADER_ANSI, layout.header_fixed)[0]
+        has_issig = layout.file_ansi > 0
+        counts = struct.unpack_from(f"<{17 if has_issig else 16}i", self.header.fixed)
+        names = ["languages", "messages", "permissions", "types", "components", "tasks", "dirs"]
+        names += ["issig", "files", "locations", "icons", "ini", "registry", "install_delete",
+                  "uninstall_delete", "run", "uninstall_run"] if has_issig else \
+                 ["files", "locations", "icons", "ini", "registry", "install_delete", "uninstall_delete",
+                  "run", "uninstall_run"]
+        self.counts = dict(zip(names, counts))
+        if any(count < 0 or count > len(self.setup0) for count in self.counts.values()):
+            raise InnoError("entry counts make no sense, the layout doesn't fit this file")
+        method = self.header.fixed[layout.compress_offset]
+        if method >= len(COMPRESSION):
+            raise InnoError("unknown compression method, the layout doesn't fit this file")
+        self.compression = COMPRESSION[method]
+        self.languages = read_entries(reader, self.counts["languages"], layout.language_strings, 4, layout.language_fixed)
+        read_entries(reader, self.counts["messages"], 2, 0, 4)
+        read_entries(reader, self.counts["permissions"], 0, 1, 0)
+        read_entries(reader, self.counts["types"], 4, 0, 30)
+        read_entries(reader, self.counts["components"], 5, 0, layout.component_fixed)
+        read_entries(reader, self.counts["tasks"], 6, 0, layout.task_fixed)
+        read_entries(reader, self.counts["dirs"], 7, 0, 27)
+        if has_issig:
+            read_entries(reader, self.counts["issig"], 3, 0, 0)
+        self.files = read_entries(reader, self.counts["files"], layout.file_strings, layout.file_ansi, layout.file_fixed)
+        self.icons = read_entries(reader, self.counts["icons"], 13, 0, layout.icon_fixed)
+        self.ini = read_entries(reader, self.counts["ini"], 10, 0, 21)
+        self.registry = read_entries(reader, self.counts["registry"], 9, 0, layout.registry_fixed)
+        self.install_delete = read_entries(reader, self.counts["install_delete"], 7, 0, 21)
+        self.uninstall_delete = read_entries(reader, self.counts["uninstall_delete"], 7, 0, 21)
+        self.run = read_entries(reader, self.counts["run"], layout.run_strings, 0, layout.run_fixed)
+        self.uninstall_run = read_entries(reader, self.counts["uninstall_run"], layout.run_strings, 0, layout.run_fixed)
+        images = struct.unpack("<i", reader.take(4))[0]
+        if not -1 <= images <= 256:
+            raise InnoError("no wizard images after the entries, the layout doesn't fit this file")
+        self.locations = self._locations()
+
+    def _locations(self):
+        size = self.layout.location_fixed
+        count = self.counts["locations"]
+        if len(self.location_data) != count * size:
+            raise InnoError(f"{len(self.location_data)} bytes of file locations for {count} entries of {size}, "
+                            "the layout doesn't fit this file")
+        wide_start = size == 89
+        old_flags = size in (74, 75, 87)
+        digest_size = 20 if size in (74, 75) else 32
+        call_bit, encrypted_bit, compressed_bit = (4, 6, 7) if old_flags else (2, 3, 4)
+        flags_size = 2 if old_flags else 1
+        locations = []
+        for index in range(count):
+            raw = self.location_data[index * size:(index + 1) * size]
+            first, last = struct.unpack_from("<ii", raw)
+            pos = 8
+            start = struct.unpack_from("<Q" if wide_start else "<I", raw, pos)[0]
+            pos += 8 if wide_start else 4
+            suboffset, length, compressed_size = struct.unpack_from("<qqq", raw, pos)
+            pos += 24
+            digest = raw[pos:pos + digest_size]
+            pos += digest_size + 16  # timestamp and file version
+            flags = int.from_bytes(raw[pos:pos + flags_size], "little")
+            locations.append(Location(index, first, last, start, suboffset, length, compressed_size, digest,
+                                      "sha1" if digest_size == 20 else "sha256", bool(flags >> call_bit & 1),
+                                      bool(flags >> encrypted_bit & 1), bool(flags >> compressed_bit & 1)))
+        if self.encryption == "none" and any(location.encrypted for location in locations):
+            self.encryption = "files"
+        return locations
+
+    def file_location(self, entry):
+        return struct.unpack_from("<i", entry.fixed, 33 * self.layout.file_ansi + 20)[0]
+
+    def file_options(self, entry):
+        offset = 33 * self.layout.file_ansi + 38
+        return entry.fixed[offset + 1 if self.layout.file_fixed == 81 else offset]
+
+    @property
+    def code(self):
+        return self.header.ansi[CODE]
+
+
+class ChunkStream:
+    """Decompress one chunk of file data on demand, which can be gigabytes when solid."""
+
+    def __init__(self, view, location, method, total):
+        pos = location.start_offset
+        if bytes(view[pos:pos + 4]) != CHUNK_ID:
+            raise InnoError(f"no chunk at {pos:#x}")
+        pos += 4
+        self.view = view
+        self.pos = pos
+        self.end = pos + location.compressed_size
+        if self.end > len(view):
+            raise InnoError("chunk runs past the end of the file")
+        self.tail = b""
+        self.method = method if location.compressed else "stored"
+        limit = max(total, 1 << 16)
+        if self.method == "lzma":
+            props = bytes(view[pos:pos + 5])
+            self.pos += 5
+            self.decoder = lzma.LZMADecompressor(format=lzma.FORMAT_RAW, filters=[lzma_filter(props, limit)])
+        elif self.method == "lzma2":
+            prop = view[pos]
+            self.pos += 1
+            dictionary = 0xFFFFFFFF if prop == 40 else (2 | (prop & 1)) << (prop // 2 + 11)
+            self.decoder = lzma.LZMADecompressor(format=lzma.FORMAT_RAW, filters=[
+                {"id": lzma.FILTER_LZMA2, "dict_size": max(min(dictionary, limit), 4096)}])
+        elif self.method == "zip":
+            self.decoder = zlib.decompressobj()
+        elif self.method == "bzip2":
+            self.decoder = bz2.BZ2Decompressor()
+
+    def _input(self, size=1 << 20):
+        piece = bytes(self.view[self.pos:min(self.pos + size, self.end)])
+        self.pos += len(piece)
+        return piece
+
+    def read(self, size):
+        out = bytearray()
+        while len(out) < size:
+            wanted = size - len(out)
+            if self.method == "stored":
+                piece = self._input(wanted)
+                exhausted = not piece
+            elif self.method == "zip":
+                self.tail = self.tail or self._input()
+                piece = self.decoder.decompress(self.tail, wanted)
+                self.tail = self.decoder.unconsumed_tail
+                exhausted = not piece and not self.tail and self.pos >= self.end
+            else:
+                feed = self._input() if self.decoder.needs_input and not self.decoder.eof else b""
+                if self.decoder.eof:
+                    piece = b""
+                else:
+                    piece = self.decoder.decompress(feed, wanted)
+                exhausted = not piece and (self.decoder.eof or (self.decoder.needs_input and self.pos >= self.end))
+            if exhausted:
+                raise InnoError(f"chunk ended {wanted} bytes early")
+            out += piece
+        return out
+
+
+CALL_OR_JMP = re.compile(rb"[\xe8\xe9]")
+
+
+def undo_call_filter(buffer, address_offset):
+    """Undo in place the filter that makes the operands of CALL and JMP absolute.
+
+    Only the low 24 bits change. The high byte is flipped when bit 23 is set,
+    and operands whose high byte isn't 00 or FF were left alone by the compiler.
+    """
+    limit = len(buffer) - 4
+    position = 0
+    while limit > 0:
+        match = CALL_OR_JMP.search(buffer, position, limit)
+        if not match:
+            return
+        position = match.start() + 1
+        high = buffer[position + 3]
+        if high in (0x00, 0xFF):
+            address = (address_offset + position + 4) & 0xFFFFFF
+            relative = (buffer[position] | buffer[position + 1] << 8 | buffer[position + 2] << 16) - address
+            if relative & 0x800000:
+                buffer[position + 3] = high ^ 0xFF
+            buffer[position] = relative & 0xFF
+            buffer[position + 1] = relative >> 8 & 0xFF
+            buffer[position + 2] = relative >> 16 & 0xFF
+        position += 4
+
+
+def safe_relative(destination):
+    """Map a destination such as {app}\\sub\\file.exe to a path that stays under the output."""
+    parts = []
+    for part in re.split(r"[\\/]+", destination):
+        part = re.sub(r"[{}]", "", part)
+        # Windows ignores trailing dots and spaces. Removing them also turns ".." into nothing.
+        part = re.sub(r'[<>:"|?*\x00-\x1f]', "_", part).rstrip(" .")
+        if not part:
+            continue
+        if part.split(".")[0].upper() in WINDOWS_DEVICES:
+            part = "_" + part
+        parts.append(part)
+    return os.path.join(*parts) if parts else "unnamed"
+
+
+def unique_path(path, digest, taken):
+    """Keep variants that share a destination, such as one per language, under numbered names."""
+    candidate = path
+    number = 1
+    while taken.get(os.path.normcase(candidate), digest) != digest:
+        number += 1
+        candidate = f"{path}~{number}"
+    taken[os.path.normcase(candidate)] = digest
+    return candidate
+
+
+def extract_location(stream, location, targets):
+    """Copy one file out of the chunk, restoring the bytes, and verify its hash."""
+    digest = hashlib.new(location.hash_name)
+    partial = targets[0] + ".part"
+    os.makedirs(os.path.dirname(targets[0]), exist_ok=True)
+    left = location.size
+    address = 0
+    try:
+        with open(partial, "wb") as output:
+            while left:
+                buffer = stream.read(min(left, FILTER_BLOCK))
+                if location.call_filter:
+                    undo_call_filter(buffer, address)
+                    address = (address + len(buffer)) & 0xFFFFFFFF
+                digest.update(buffer)
+                output.write(buffer)
+                left -= len(buffer)
+        if digest.digest() != location.digest:
+            return False
+        os.replace(partial, targets[0])
+    finally:
+        if os.path.exists(partial):
+            os.remove(partial)
+    for extra in targets[1:]:
+        os.makedirs(os.path.dirname(extra), exist_ok=True)
+        shutil.copyfile(targets[0], extra)
+    return True
+
+
+def escape(text):
+    """Keep names from the installer from reaching the terminal as control sequences."""
+    out = []
+    for char in text:
+        if char == "\\" or char.isprintable():
+            out.append(char)
+        elif char == "\t":
+            out.append("\\t")
+        elif char == "\n":
+            out.append("\\n")
+        elif char == "\r":
+            out.append("\\r")
+        else:
+            out.append(f"\\u{ord(char):04x}" if ord(char) < 0x10000 else f"\\U{ord(char):08x}")
+    return "".join(out)
+
+
+def fields(*pairs):
+    return "\t".join(f"{name}={escape(value)}" for name, value in pairs if value)
+
+
+def conditions(strings, components, tasks, languages, check):
+    return [("components", strings[components]), ("tasks", strings[tasks]), ("languages", strings[languages]),
+            ("check", strings[check])]
+
+
+def command_info(installer, args):
+    header = installer.header.strings
+    locations = installer.locations
+    print(f"format\t{installer.version}")
+    print(f"app\t{escape(header[APP_NAME])}")
+    print(f"version\t{escape(header[APP_VERSION])}")
+    print(f"publisher\t{escape(header[APP_PUBLISHER])}")
+    print(f"app id\t{escape(header[APP_ID])}")
+    print(f"compression\t{installer.compression}")
+    print(f"encryption\t{installer.encryption}")
+    print(f"embedded data\t{'yes' if installer.offset1 else 'no, it is in setup-1.bin'}")
+    print(f"languages\t{', '.join(escape(language.strings[0]) for language in installer.languages)}")
+    print(f"files\t{installer.counts['files']} entries, {len(locations)} stored, "
+          f"{sum(location.size for location in locations)} bytes")
+    print(f"chunks\t{len({(location.first_slice, location.start_offset) for location in locations})}")
+    print(f"run\t{installer.counts['run']} on install, {installer.counts['uninstall_run']} on uninstall")
+    print(f"registry\t{installer.counts['registry']}")
+    print(f"code\t{len(installer.code)} bytes")
+
+
+def command_list(installer, args):
+    for entry in installer.files:
+        strings = entry.strings
+        index = installer.file_location(entry)
+        extra = fields(*conditions(strings, FILE_COMPONENTS, FILE_TASKS, FILE_LANGUAGES, FILE_CHECK))
+        if index >= 0:
+            location = installer.locations[index]
+            first = f"{location.size}\t{location.hash_name}:{location.digest.hex()}"
+        elif entry.fixed[-1] == FILE_UNINSTALLER:
+            first = "-\tuninstaller"
+        else:
+            first = "-\texternal"
+            extra = "\t".join(item for item in (fields(("source", strings[FILE_SOURCE])), extra) if item)
+        print("\t".join(item for item in (first, escape(strings[FILE_DEST]), extra) if item))
+
+
+def print_section(title, lines):
+    if lines:
+        print(f"[{title}]")
+        for line in lines:
+            print(line)
+        print()
+
+
+def run_lines(installer, entries):
+    lines = []
+    offset = 26 if installer.layout.run_fixed == 28 else 25
+    for entry in entries:
+        strings = entry.strings
+        options = entry.fixed[offset]
+        flags = []
+        if options & RUN_SHELLEXEC:
+            flags.append("shellexec")
+        if options & RUN_POSTINSTALL:
+            flags.append("postinstall")
+        if entry.fixed[24] == RUN_NOWAIT:
+            flags.append("nowait")
+        lines.append(fields(("name", strings[RUN_NAME]), ("params", strings[RUN_PARAMS]),
+                            ("workingdir", strings[RUN_DIR]), ("verb", strings[RUN_VERB]),
+                            ("flags", " ".join(flags)),
+                            *conditions(strings, RUN_COMPONENTS, RUN_TASKS, RUN_LANGUAGES, RUN_CHECK)))
+    return lines
+
+
+def registry_lines(installer):
+    lines = []
+    for entry in installer.registry:
+        strings = entry.strings
+        root = struct.unpack_from("<I", entry.fixed, 20)[0]
+        kind = entry.fixed[26]
+        lines.append(fields(("root", REGISTRY_ROOTS.get(root, f"{root:#x}")), ("subkey", strings[REG_SUBKEY]),
+                            ("name", strings[REG_VALUE_NAME]),
+                            ("type", REG_TYPES[kind] if kind < len(REG_TYPES) else str(kind)),
+                            ("data", strings[REG_VALUE_DATA]),
+                            *conditions(strings, REG_COMPONENTS, REG_TASKS, REG_LANGUAGES, REG_CHECK)))
+    return lines
+
+
+def delete_lines(entries):
+    lines = []
+    for entry in entries:
+        kind = entry.fixed[20]
+        lines.append(fields(("name", entry.strings[0]),
+                            ("type", DELETE_TYPES[kind] if kind < len(DELETE_TYPES) else str(kind))))
+    return lines
+
+
+def command_actions(installer, args):
+    print_section("Run", run_lines(installer, installer.run))
+    print_section("UninstallRun", run_lines(installer, installer.uninstall_run))
+    print_section("Registry", registry_lines(installer))
+    print_section("Ini", [fields(("file", e.strings[0]), ("section", e.strings[1]), ("key", e.strings[2]),
+                                 ("value", e.strings[3])) for e in installer.ini])
+    print_section("InstallDelete", delete_lines(installer.install_delete))
+    print_section("UninstallDelete", delete_lines(installer.uninstall_delete))
+    print_section("Icons", [fields(("name", e.strings[0]), ("target", e.strings[1]), ("params", e.strings[2]))
+                            for e in installer.icons])
+    registered = []
+    external = []
+    for entry in installer.files:
+        strings = entry.strings
+        if installer.file_options(entry) & FILE_REGSERVER:
+            registered.append(fields(("dest", strings[FILE_DEST])))
+        if installer.file_location(entry) < 0 and entry.fixed[-1] != FILE_UNINSTALLER:
+            external.append(fields(("source", strings[FILE_SOURCE]), ("dest", strings[FILE_DEST])))
+    print_section("RegisterServer", registered)
+    print_section("External", external)
+
+
+PROCEDURE = re.compile(rb"(?<![A-Za-z0-9_])[A-Z_][A-Z0-9_]{3,}(?![a-z0-9_])")
+IMPORT = re.compile(rb"(?:dll|class|intf):[\x20-\x7e]{1,200}(?:\x00[\x20-\x7e]{1,200})?")
+ASCII_TEXT = re.compile(rb"[\x20-\x7e]{6,}")
+WIDE_TEXT = re.compile(rb"(?:[\x20-\x7e]\x00){4,}")
+
+
+def command_code(installer, args):
+    code = installer.code
+    if not code:
+        print("no [Code] section")
+        return
+    if args.dump:
+        with open(args.dump, "wb") as output:
+            output.write(code)
+    print(f"bytes\t{len(code)}")
+    if code[:4] != b"IFPS":
+        print("not a compiled script, nothing to scan")
+        return
+    print_section("Imports", sorted({escape(match.replace(b"\0", b" ").decode("latin1"))
+                                     for match in IMPORT.findall(code)}))
+    print_section("Names", sorted({match.decode("latin1") for match in PROCEDURE.findall(code)}))
+    texts = {match.decode("latin1") for match in ASCII_TEXT.findall(code)}
+    texts |= {match.decode("utf-16-le") for match in WIDE_TEXT.findall(code)}
+    print_section("Strings", sorted(escape(text) for text in texts
+                                    if re.search(r"[a-z.\\/:]", text) and not IMPORT.match(text.encode("latin1", "replace"))))
+
+
+def command_extract(installer, args):
+    if not installer.offset1:
+        raise InnoError("the data isn't inside the EXE, this needs setup-1.bin")
+    output_root = os.path.realpath(args.dir)
+    os.makedirs(output_root, exist_ok=True)
+    wanted = {}
+    taken = {}
+    for entry in installer.files:
+        index = installer.file_location(entry)
+        destination = entry.strings[FILE_DEST]
+        if index < 0:
+            continue
+        if args.only and not any(fnmatch.fnmatch(destination.lower(), pattern.lower()) for pattern in args.only):
+            continue
+        location = installer.locations[index]
+        path = unique_path(os.path.join(output_root, safe_relative(destination)), location.digest, taken)
+        if os.path.commonpath((output_root, os.path.realpath(path))) != output_root:
+            raise InnoError(f"destination leaves the output directory: {escape(destination)}")
+        if path not in wanted.setdefault(index, []):
+            wanted[index].append(path)
+    chunks = {}
+    for index in wanted:
+        location = installer.locations[index]
+        chunks.setdefault((location.first_slice, location.start_offset), []).append(location)
+    written = skipped = failed = 0
+    for key in sorted(chunks):
+        members = sorted(chunks[key], key=lambda location: location.chunk_suboffset)
+        if members[0].encrypted:
+            skipped += len(members)
+            for location in members:
+                print(f"encrypted, skipped\t{escape(wanted[location.index][0])}", file=sys.stderr)
+            continue
+        total = max(location.chunk_suboffset + location.size for location in members)
+        base = members[0]._replace(start_offset=installer.offset1 + key[1])
+        stream = ChunkStream(installer.view, base, installer.compression, total)
+        position = 0
+        for location in members:
+            if location.chunk_suboffset < position:
+                stream = ChunkStream(installer.view, base, installer.compression, total)
+                position = 0
+            while position < location.chunk_suboffset:
+                position += len(stream.read(min(location.chunk_suboffset - position, 1 << 20)))
+            if extract_location(stream, location, wanted[location.index]):
+                written += len(wanted[location.index])
+            else:
+                failed += 1
+                print(f"hash mismatch, removed\t{escape(wanted[location.index][0])}", file=sys.stderr)
+            position += location.size
+    print(f"{written} files written to {escape(output_root)}, {skipped} skipped, {failed} failed")
+    return 1 if failed or skipped else 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Read Inno Setup 6.0 to 7.1 installers without running them.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name, handler, help_text in (("info", command_info, "format, application and storage"),
+                                     ("list", command_list, "files with size, hash and destination"),
+                                     ("actions", command_actions, "what the installer does besides copying files")):
+        command = commands.add_parser(name, help=help_text)
+        command.add_argument("file")
+        command.set_defaults(handler=handler)
+    command = commands.add_parser("code", help="names and strings in the compiled [Code] script")
+    command.add_argument("file")
+    command.add_argument("--dump", help="also write the compiled script to this file")
+    command.set_defaults(handler=command_code)
+    command = commands.add_parser("extract", help="write the embedded files and verify their hashes")
+    command.add_argument("file")
+    command.add_argument("dir")
+    command.add_argument("--only", action="append", help="glob on the destination, any case, can repeat")
+    command.set_defaults(handler=command_extract)
+    args = parser.parse_args()
+    try:
+        with open(args.file, "rb") as source:
+            if os.fstat(source.fileno()).st_size == 0:
+                raise InnoError("empty file")
+            with mmap.mmap(source.fileno(), 0, access=mmap.ACCESS_READ) as view:
+                return args.handler(Installer(view), args) or 0
+    except (InnoError, lzma.LZMAError, zlib.error, OSError) as error:
+        print(f"inno-unpack: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

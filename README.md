@@ -50,6 +50,11 @@ Skills and helper scripts for Claude Code reverse-engineering work. New skills g
 - `bin/ue-save`: reads Unreal Engine save files (GVAS), also inside Unreal's compressed chunk format
   with zlib or Oodle, and lists the header and the properties with their values (`props`) or writes
   the plain GVAS (`unpack`).
+- `bin/inno-unpack` reads Inno Setup installers from version 6.0 to 7.1 without running them. Prints
+  the format and how the data is stored (`info`), the files with size and hash (`list`), what the
+  installer does besides copying files (`actions`) and the names and strings in the compiled `[Code]`
+  script (`code`), and writes the embedded files after checking each hash (`extract`). Anything older
+  than 6.0 still needs innoextract.
 
 ## Setup
 
@@ -72,6 +77,7 @@ ln -sfn "$PWD/bin/pe-stacks" ~/.local/bin/pe-stacks
 ln -sfn "$PWD/skills/unreal-engine" ~/.claude/skills/unreal-engine
 ln -sfn "$PWD/skills/dotnet-decompile" ~/.claude/skills/dotnet-decompile
 ln -sfn "$PWD/skills/native-memory-tracing" ~/.claude/skills/native-memory-tracing
+ln -sfn "$PWD/bin/inno-unpack" ~/.local/bin/inno-unpack
 java-decompile --check
 bpl-xref --help > /dev/null && echo 'bpl-xref ok'   # fails if pefile is missing
 ```
@@ -106,6 +112,10 @@ Requirements for `kismet-trace`:
 - Python 3, standard library only
 - A JSON export from [CUE4Parse](https://github.com/FabianFG/CUE4Parse) made with `ReadScriptData`
   set on the provider, so the functions carry their bytecode
+
+Requirements for `inno-unpack`:
+
+- Python 3, standard library only
 
 Requirements for `binary-diff`:
 
@@ -152,6 +162,11 @@ kismet-trace follow Level.umap.json OnDoorOpened
 ue-locres Game.locres "old door"
 ue-save props slot1.sav --oodle oodle-data-shared.dll --depth 1
 bpl-xref vmt app.exe TFORDEREDIT
+
+inno-unpack info setup.exe
+inno-unpack actions setup.exe
+inno-unpack code setup.exe --dump script.bin
+inno-unpack extract setup.exe /tmp/setup-files --only '*.exe'
 ```
 
 `--clean` only empties directories that java-decompile created or initialized while they were empty
@@ -164,8 +179,8 @@ python3 -m unittest discover -s tests
 ```
 
 The tests build their inputs in code (small PE files for `bpl-xref`, a blueprint export for
-`kismet-trace`, localization files and saves for `ue-locres` and `ue-save`), so no real binaries or
-games are needed. The `bpl-xref` tests need `pefile` and are
+`kismet-trace`, localization files and saves for `ue-locres` and `ue-save`, installers of every
+format for `inno-unpack`), so no real binaries or games are needed. The `bpl-xref` tests need `pefile` and are
 skipped without it.
 
 ## License
