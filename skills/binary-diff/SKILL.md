@@ -31,6 +31,22 @@ The PyPI release (1.0.0) crashes at the end of a run on Python 3.14 when a funct
 decompile, misses changes in functions matched by name that kept their size, and can pair one
 function with two others through implied matches.
 
+## Look at the exports first
+
+For a library with exported names, compare the names before running ghidriff. It takes seconds and
+answers what was added or removed.
+
+```sh
+rz-bin -E app_1.0.bpl | awk '{print $NF}' | sort > old.exports
+rz-bin -E app_1.1.bpl | awk '{print $NF}' | sort > new.exports
+comm -13 old.exports new.exports | grep 'TClassName@'   # only in 1.1
+comm -23 old.exports new.exports | grep 'TClassName@'   # only in 1.0
+```
+
+New methods on a class are often most of the story of a regression, for example a setter that gained
+helper methods because its body grew. Disassemble the function that exists in both builds, as the
+`delphi-bpl` skill describes, and read what the new methods are called from.
+
 ## Run
 
 Give the two files different names, because ghidriff names the programs and the project after them.
@@ -42,6 +58,10 @@ GHIDRA_INSTALL_DIR=/opt/ghidra ~/.venvs/ghidriff/bin/ghidriff --no-symbols \
 
 - `--no-symbols` skips the symbol server lookup. Leave it out only for Windows binaries that have
   public PDBs.
+- `--force-diff` is needed when the two files differ too much in symbols or architecture. Without it
+  the run stops with a message such as `Symbol counts differ by N`. The option tells ghidriff to match
+  anyway. Use it when the difference is expected, for example when a build dropped a whole module, and
+  expect more functions in the added and deleted lists.
 - A 14 MB 32-bit library with 56,000 functions took 17 to 19 minutes on 20 cores the first time
   (import and analysis of both files) and 3 to 7 minutes on a rerun with the same `-p`, which reuses
   the analyzed programs. The project used 420 MB. Keep it while you iterate and delete it afterwards.
