@@ -61,6 +61,12 @@ preferred range is taken, so treat every absolute address as something the loade
   A jump into the middle of your new bytes executes garbage.
 - Some fixes need no new code. Turning `lea eax, [ebp-x]` into `mov eax, [ebp-x]` (passing the value
   instead of the address of a local) is a one-byte change.
+- Removing a call needs no cave. When a call only does harm, such as a cleanup that runs on a path
+  where its argument is already nil, replace the instructions that set it up and make it with `nop`s of
+  the same total length. An `xor edx, edx` plus `call rel32` is 7 bytes, so 7 `nop`s. Before doing it,
+  search for the readers of whatever the removed call writes. A call that fills or clears a field can
+  look like the cause of a crash while another routine depends on that field being filled, and removing
+  the writer leaves it empty.
 
 ## New code in a cave
 
@@ -218,6 +224,12 @@ assert mu.reg_read(UC_X86_REG_EBX) == 0x11111111
 - To test the path where a callee raises, have its fake read the top frame from that page, unlink it, set `esp` to
   the frame and `ebp` from its saved slot, and jump to its handler. Assert that the cleanup runs exactly once and
   the frame chain is back where it started.
+- Reproduce the reported failure before testing the fix. Run the unpatched code in the same harness and
+  check that it faults at the instruction the crash log names, or at the same offset when the module
+  loads elsewhere. A harness that reproduces the real crash is a model of the program, and one that only
+  passes the patched code proves much less. Then run the same sequence on the patched bytes, in the
+  order the program uses, such as several messages in a row against the same object. A bug that depends
+  on state left by the previous call does not show up in a single call.
 
 Cover every case the code branches on, such as the empty state, each side of every comparison, the
 exact boundary values and counter wraparound. Hooks only need to map the page of the target, since
@@ -288,3 +300,8 @@ message gives nothing to read. Capture what happened before guessing.
   processes have the file mapped before replacing it.
 - Look for an updater or launcher that copies files from a server at startup. It will undo the patch
   silently.
+- A signed executable loses its signature when any byte changes. A nonzero size in
+  `DATA_DIRECTORY[4]` of the optional header means the file carries an Authenticode block. Policies that
+  check signatures, such as application allow lists, can refuse the patched file, and so can an updater
+  or service manager that verifies hashes. Keep the signed original and its hash next to the patched
+  copy.
