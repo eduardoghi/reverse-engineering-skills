@@ -319,6 +319,26 @@ both depends on the data.
   released with `@System@@IntfClear`. `TObject.Free` or `FreeAndNil` on one calls through the wrong
   table and usually crashes. An object created and then overwritten without a `Free` is a leak.
 
+- **Which method a virtual call reaches.** `call dword [ecx + 0x34]` after `mov ecx, [eax]` calls slot 0x34 of
+  the object's VMT. To list what that slot runs in each class, search the file for the address of each candidate
+  method as a dword. The match is the VMT slot, and its offset is the match address minus the class VMT export
+  (`@Unit@TClass@`). Methods that are only reached through a slot show no `call` references, so this is also how
+  to find who runs them.
+- **`TStringList.Objects`.** Up to Delphi 2007 a `TStringList` never owns the objects stored with `AddObject`, and
+  freeing the list leaves them alive. Code that hangs a freshly loaded collection on a list owned by a short-lived
+  object leaks one collection per object. The same fact makes it safe to keep a pointer to such an object after
+  the list is gone. Check the `Destroy` of the owner, and of the classes in the collection, before relying on it.
+- **`TWriter` and `TReader` streams.** Component streams and many custom file formats are written value by value.
+  `ReadInteger`, `ReadBoolean`, `ReadString`, `ReadDate` and `ReadListBegin` read a one-byte type code first, and
+  `ReadStr` (a short string) does not. The codes up to Delphi 2007 are 0 `vaNull` (end of list), 1 `vaList`,
+  2 `vaInt8`, 3 `vaInt16`, 4 `vaInt32`, 5 `vaExtended` (10 bytes), 6 `vaString` (length byte), 7 `vaIdent`,
+  8 `vaFalse`, 9 `vaTrue`, 10 `vaBinary`, 11 `vaSet`, 12 `vaLString` (32-bit length), 13 `vaNil`,
+  14 `vaCollection`, 15 `vaSingle`, 16 `vaCurrency`, 17 `vaDate` (8-byte double), 18 `vaWString` (32-bit length of
+  UTF-16 units), 19 `vaInt64` and 20 `vaUTF8String`. With the reads of the loader in order, a field near the start
+  of a file can be read without loading the rest. Find the loader by searching for the field's offset in the
+  class (`add eax, OFFSET` before `@LStrAsg`, or `mov [reg + OFFSET], eax`) and follow the reads before it,
+  including the version checks (`cmp dword [eax + n], VERSION`) that skip fields in old files.
+
 ## Comparing two builds
 
 Export names stay the same between builds of a package and addresses don't. Match exported
