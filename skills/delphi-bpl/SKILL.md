@@ -352,6 +352,13 @@ both depends on the data.
   see who triggers it. In one case only the destructor and an import routine of other subclasses cleared the flag,
   so the data stayed in memory until the program closed. The same offset is a different field in an unrelated
   class, so stay within the class and its descendants, which share the field layout.
+- **A stored change that has no effect.** When the program keeps ignoring a value that was changed where it is
+  stored, look for a cache of the processed result, often a file in the temporary directory or next to the data.
+  Search for format strings that build file names (`bpl-xref str app.bpl '%s.'`) and for calls to the temporary
+  directory helper, then read the check that decides whether the cache is still valid. It often compares a
+  version, a size and a hash of only part of the input. In one case the processed form of some data was cached
+  under a hash of its text alone, so changing an option stored elsewhere did nothing until the cache file was
+  deleted.
 
 ## Comparing two builds
 
