@@ -338,6 +338,20 @@ both depends on the data.
   of a file can be read without loading the rest. Find the loader by searching for the field's offset in the
   class (`add eax, OFFSET` before `@LStrAsg`, or `mov [reg + OFFSET], eax`) and follow the reads before it,
   including the version checks (`cmp dword [eax + n], VERSION`) that skip fields in old files.
+- **When something is loaded again.** Code that loads data once (a list read from a database, a cached object)
+  usually guards it with a field of the object. It tests the field (`cmp byte [eax+0x1c], 0`), loads, and then
+  sets it (`mov byte [eax+0x1c], 1`). To learn when the data is loaded again, find every write to that offset in the methods
+  of the class. Take the address range of the class's exports and search the disassembly:
+
+  ```sh
+  objdump -d -M intel --no-show-raw-insn --start-address=0x... --stop-address=0x... app.bpl |
+      grep -E 'mov +BYTE PTR \[e[a-z]+\+0x1c\]'
+  ```
+
+  Each write of zero is a place that invalidates the data. Run `bpl-xref calls` on the methods that hold them to
+  see who triggers it. In one case only the destructor and an import routine of other subclasses cleared the flag,
+  so the data stayed in memory until the program closed. The same offset is a different field in an unrelated
+  class, so stay within the class and its descendants, which share the field layout.
 
 ## Comparing two builds
 
