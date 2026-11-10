@@ -37,6 +37,15 @@ for p in /proc/[0-9]*; do tr '\0' ' ' < $p/cmdline 2>/dev/null | grep -q '^C:.Di
   `syscr` counters of the process. A main thread in `ntsync_schedule` with flat counters is waiting on a
   Windows object, which for a program with a message loop usually means it is idle, so check this
   before profiling a screen the user calls slow.
+- To measure the cost of each item of a list (a model, a record, a file the program opens per item), start
+  the program as a child of `strace` and log the opens with time stamps:
+  `strace -f -tt -e trace=openat,open -o opens.txt wine app.exe`. With `kernel.yama.ptrace_scope` at 1 you can't
+  attach to a running program, but a child is allowed. Group the opens by file name. The same file opened in
+  two separate bursts usually means two passes over the list (building it, then checking each item), so take the
+  first open of each file for one pass and the second for the other. The interval between consecutive items of a
+  pass is the cost per item. Leave out intervals longer than a second or two, which are the user doing something
+  else, and report how many you left out. In one case this showed 9 seconds for the pass that built a list and
+  382 seconds for a second pass that loaded every item again to read one field.
 - Many sockets show up as `sendmsg` and `recvmsg` to the wine server. Count the ones on the database
   socket and the gap between a send and the next read to get the round trip time. In one case 1281
   round trips cost 0.7 seconds in total, which cleared the database of any blame.
@@ -201,6 +210,11 @@ need, and redirect stderr to a file.
   purpose. A Delphi program raises many, so the file grows to tens of megabytes. The last lines show
   which handler was running when it died. An access violation with `ecx=cafebabe` is a Java thread
   that the JVM handles by itself and is not your crash.
+- One exception takes several lines of a `+seh` log (`dispatch_exception`, the registers, the handlers called,
+  `RtlUnwind`), so `grep -c c0000005` counts lines, not exceptions. Count the distinct `addr=` values instead.
+  An exception that a program handles is not necessarily caused by your change. Note the module it happened in,
+  run the previous file and the new one again, more than once, and compare. A handled access violation during a
+  login that talks to a network service came and went between runs of the same files.
 - `WINEDEBUG=err+all,+process` is small and logs process creation and exit.
 - `strace -f -qq -o trace.txt -e trace=exit_group,kill,tgkill -e signal=SIGSEGV,SIGKILL,SIGABRT wine app.exe`
   shows how each process ended. `exit_group(0)` is a normal exit. `+++ killed by SIGSEGV (core dumped)
