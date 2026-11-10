@@ -404,9 +404,13 @@ message gives nothing to read. Capture what happened before guessing.
 - Read the original bytes at every point and stop if any differ from what you expect. Write to a
   new file, never over the only copy.
 - Keep a backup next to the original and note both SHA-256 hashes.
-- A running process keeps the image it loaded. On Windows the file is usually locked. Under Wine or
-  Linux the copy on disk can be replaced, and the change takes effect on the next start. Check which
-  processes have the file mapped before replacing it.
+- A running process keeps the image it loaded only if the file it mapped stays intact. On Windows the
+  file is usually locked. Under Wine or Linux nothing stops you from writing to it, and writing over it
+  in place (`cp new.bpl app.bpl`, or opening it for writing) changes the pages the process has mapped.
+  The program then crashes in code that was never patched. Check which processes have the file open
+  first (`lsof app.bpl`, or the program's process list) and close them. When that isn't possible, write
+  the patched copy to a new file in the same directory and rename it over the original (`mv`). The
+  running process keeps the old file until it exits, and the next start loads the new one.
 - Look for an updater or launcher that copies files from a server at startup. It will undo the patch
   silently.
 - A signed executable loses its signature when any byte changes. A nonzero size in
