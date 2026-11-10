@@ -127,6 +127,69 @@ preferred range is taken, so treat every absolute address as something the loade
 - **Several patches in one cave.** Give each patch its own fixed part of the cave, for example one
   growing from the start and another placed just before the end of the section, so they can be
   applied in any order and each can be removed alone.
+- **A hook for one caller only.** When a routine has several callers and the change must apply to one of
+  them, compare the return address with the caller's range instead of setting a flag around the call. Inside the
+  callee's frame the return address is `[ebp+4]`. A flag set before the call and cleared after stays set when an
+  exception skips the clearing, and the next unrelated call takes the wrong path. The range check keeps no state:
+
+  ```asm
+  push ebx
+  call next
+  next:
+  pop ebx
+  mov ecx, [ebp+4]               ; return address of the routine whose frame this is
+  sub ecx, ebx
+  sub ecx, CALLER - next         ; ecx = offset of the return address inside the caller
+  cmp ecx, CALLER_SIZE
+  jb from_that_caller
+  ```
+
+  `CALLER_SIZE` is the distance to the next function, and it changes between builds.
+- **Calling your own DLL.** Logic too long for assembly, such as parsing a file format, can live in a DLL the
+  cave loads by name. Call the `LoadLibraryA` and `GetProcAddress` thunks the module already imports, and keep
+  the DLL name and the function name as zero terminated strings at the end of the cave, reached with
+  `call`/`pop`. Store the function pointer in the state slack, with zero meaning "not loaded yet" and 1
+  meaning "failed, don't try again", so a missing DLL costs one failed load per process. Export the functions
+  with the C convention (`cdecl`, the caller removes the arguments), which a 32-bit Rust or C DLL produces
+  without decoration. Give each function a way to say "don't know" (a negative result) and send the cave back
+  to the original code in that case, and also when the DLL or the function is missing. A function's name and
+  arguments never change after it ships. A new contract is a new function, so an old DLL next to new code, or
+  the other way around, falls back instead of misbehaving.
+  - A Delphi `AnsiString` parameter needs a real string with its header, not a bare `char *`, because the
+    callee may add a reference. Build one with `System.@LStrFromPChar(var Dest, Source)` into a zeroed local,
+    and release the locals with `@LStrClr` or `@LStrArrayClr` (address of the first, count) before leaving.
+    Locals for `@LStrArrayClr` must be contiguous and in increasing address order.
+  - Paths the program passes are in the ANSI code page. Convert them with `MultiByteToWideChar(CP_ACP)` in the
+    DLL instead of assuming UTF-8.
+- **Exception handling in a cave.** When the cave calls host code that may raise, such as an export routine
+  that fails for an object that doesn't exist yet, protect the call the way Delphi compiles `try ... except`.
+  The handler address goes through `call`/`pop`, so it needs no relocation:
+
+  ```asm
+  xor eax, eax
+  push ebp
+  lea ecx, [ebx + (handler - next)]
+  push ecx
+  push dword fs:[eax]
+  mov fs:[eax], esp
+  ; ... calls that may raise ...
+  xor eax, eax
+  pop edx
+  pop ecx
+  pop ecx
+  mov fs:[eax], edx
+  jmp after
+  handler:
+  jmp System.@HandleAnyException   ; the except block starts right after this jmp
+  mov dword [ebp - FAILED], 1
+  call System.@DoneExcept
+  after:
+  ```
+
+  The cave needs its own `ebp` frame, because the handler restores `ebp` from the registration. `esp` is back
+  to its value before the `try` on both paths, but `ebx`, `esi` and `edi` are not. Keep what you need in frame
+  locals and recompute the `call`/`pop` base after `after:`. Whatever the cave changed on the host object before
+  the call (a path, a flag) has to be restored on both paths.
 
 ## Assembling with keystone
 
@@ -267,9 +330,55 @@ patched, or unknown, which means another build or a half applied patch).
 - The same rule holds for points of a single patch. Two windows close together, such as two neighbouring
   strings, can each hold bytes the other one writes, so the second stops matching after the first is written. Make
   those bytes wildcards as well.
+- A patch captured by comparing the original and the patched file ends each region at the last byte that differs.
+  A string at the end of the new code loses its terminating zero, because the zero was already there. The patch
+  still works where the following bytes are zero and breaks when another patch writes right after it. Add the
+  zero back to the captured bytes.
 - Test that patches sharing a file apply in both orders, on synthetic data and on the real file. Checking that each
   original pattern matches once isn't enough. Apply everything, then check that every patched pattern matches once
   and no original pattern still does. Synthetic data, with each window laid out apart, can't show overlaps.
+
+## Moving a patch to another build
+
+A new build of the same program moves functions, data and the zero run, and often changes classes. A pattern that
+still matches in the new file proves only that the bytes around the patch points are the same. It doesn't prove
+the patch works there.
+
+- **Every `rel32` the patch writes depends on the distance between the point and its target.** A pattern without
+  addresses can match in the new build while the `jmp` it writes lands in the middle of another function. In one
+  case that crashed the program at startup with an access violation inside `TObject.Free`. Give each build its
+  own variant of the patched bytes, with enough literal context (a nearby `call rel32` to an import thunk is
+  usually different) for the variants not to match each other's files. Add a test that runs on the real files of
+  every build and checks each point that replaces an instruction with a `jmp rel32` followed only by `nop`s. Its
+  target must fall inside the bytes the same patch writes. Leave out points whose original byte was already a `jmp` or
+  `call`, which only change a target, and patches without new code, whose jumps skip original code on purpose.
+- **Run the program after applying.** Start it with `WINEDEBUG=err+all,+seh` under Wine (or a debugger on
+  Windows) and check that no access violation shows up in the patched module, before anyone uses it.
+- **Translating addresses.** Map each address the patch uses to the new build, then read the result with names.
+  - Exported functions and VMTs by name.
+  - Other code by context. Take the instructions around the address in the old build, mask every dword that
+    the relocation table lists or that falls inside the image, and search the new code section for a single
+    match. Widen the window until it is unique, and when the address is the start of a function, take context
+    from before it.
+  - `call`/`pop` displacements in the cave encode the distance to the target, so recompute them, including the
+    ones in `add reg, imm32` and `sub reg, imm32` forms.
+  - Imports by name. `pefile` leaves some import slots without a name, so find the slot by its neighbours in the
+    same import table, which keep their order between builds.
+  - The slack after a writable section moves when the section grows. Recompute its address from the new
+    `VirtualSize` and check that it stays inside the same page.
+  - Code that the normal flow never reaches still needs translating. An exception handler is entered through an
+    address the code pushes, so a scan that follows calls and jumps from the entry points skips it and leaves its
+    `jmp` to the runtime pointing at the old address.
+  - Compare the translated targets by name on both sides (export and offset), and read every difference.
+    A different offset inside a large exported region is often the region growing, not a wrong target.
+- **Classes and frames change.** Before reusing a field offset, find how the new build accesses it. Align the
+  instruction lists of a function that uses the field in both builds and check that every use of the old offset
+  maps to the same new offset. When a new field shifts the rest by 8, the mapping is consistent across all uses.
+  Do the same for the locals (`[ebp - n]`) of a host function whose frame the cave reads.
+- **The host code may have changed around the point.** A function rewritten in the new build can lose the
+  instruction the patch hooked, or gain a second path to it, such as a branch for encrypted content next to the
+  plain one. Read the new function before reusing the point, and hook a place that every path you care about
+  passes through, or only the path where the patch makes sense.
 
 ## When the program dies after patching
 
