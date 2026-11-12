@@ -111,22 +111,39 @@ java-decompile --check
 bpl-xref --help > /dev/null && echo 'bpl-xref ok'   # fails if pefile is missing
 ```
 
+### Windows
+
+Windows runs a script by its extension and ignores the `#!` line, so each script in `bin/` has a `.cmd` next to
+it that runs it with `python` (or `bash`, for `java-decompile`). The scripts run by name once `bin\` is on
+`PATH`, which the plugin already does. They need `python` on `PATH` for Python 3, and `java-decompile` needs Git
+Bash. On a clone, run this in PowerShell from the repository folder (it can be re-run safely). Junctions are
+used because symbolic links need administrator rights or Developer Mode:
+
+```powershell
+New-Item -ItemType Directory -Force "$HOME\.claude\skills" | Out-Null
+foreach ($s in 'java-decompile', 'delphi-bpl', 'binary-diff', 'binary-patch', 'unreal-engine', 'dotnet-decompile', 'installer-triage') {
+    if (-not (Test-Path "$HOME\.claude\skills\$s")) { New-Item -ItemType Junction -Path "$HOME\.claude\skills\$s" -Target "$PWD\skills\$s" | Out-Null }
+}
+$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+if (($userPath -split ';') -notcontains "$PWD\bin") { [Environment]::SetEnvironmentVariable('Path', "$userPath;$PWD\bin", 'User') }
+```
+
+Open a new terminal for the `PATH` change to take effect.
+
 ### Skills that need Linux
 
 `wine-debugging` and `native-memory-tracing` only work on a Linux host, since they rely on Wine, `perf`,
-`strace`, `LD_PRELOAD` and `/proc`. Their `SKILL.md` declares this in the frontmatter, along with the scripts
-in `bin/` that only that skill uses:
+`strace`, `LD_PRELOAD` and `/proc`. That is why the Windows setup above leaves them out, and why `bin/pe-stacks`
+and `bin/gem-log.c` have no `.cmd`. Their `SKILL.md` declares this in the frontmatter:
 
 ```yaml
 metadata:
   os: [linux]
-  scripts: [pe-stacks]
 ```
 
-The values of `os` are `linux`, `macos` and `windows`, and a skill without `os` runs on all of them. Claude Code
-ignores both fields, so the plugin still lists these skills on Windows. The fields are there for scripts that
-link the skills one by one, which can skip a skill whose list leaves out the current system, together with its
-scripts. When linking by hand on Windows, leave out these two skills and `bin/pe-stacks`.
+The values are `linux`, `macos` and `windows`, and a skill without `os` runs on all of them. Claude Code ignores
+the field, so the plugin still lists these skills on Windows. It is there for scripts that link the skills one
+by one, which can skip a skill whose list leaves out the current system.
 
 Requirements for `java-decompile`:
 
