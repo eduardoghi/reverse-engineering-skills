@@ -111,6 +111,23 @@ java-decompile --check
 bpl-xref --help > /dev/null && echo 'bpl-xref ok'   # fails if pefile is missing
 ```
 
+### Skills that need Linux
+
+`wine-debugging` and `native-memory-tracing` only work on a Linux host, since they rely on Wine, `perf`,
+`strace`, `LD_PRELOAD` and `/proc`. Their `SKILL.md` declares this in the frontmatter, along with the scripts
+in `bin/` that only that skill uses:
+
+```yaml
+metadata:
+  os: [linux]
+  scripts: [pe-stacks]
+```
+
+The values of `os` are `linux`, `macos` and `windows`, and a skill without `os` runs on all of them. Claude Code
+ignores both fields, so the plugin still lists these skills on Windows. The fields are there for scripts that
+link the skills one by one, which can skip a skill whose list leaves out the current system, together with its
+scripts. When linking by hand on Windows, leave out these two skills and `bin/pe-stacks`.
+
 Requirements for `java-decompile`:
 
 - Java 17+ with the JDK tools (`javap`, `jar`)

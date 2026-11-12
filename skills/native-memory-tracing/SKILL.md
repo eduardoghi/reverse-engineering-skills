@@ -1,6 +1,8 @@
 ---
 name: native-memory-tracing
 description: Find what keeps growing in a native program on Linux when you don't have its source or its symbols, including GPU memory that doesn't show up in RSS. Use when a program or media pipeline slows down the machine or gets killed by the OOM killer, to measure memory per DRM client, to record who allocates with an LD_PRELOAD shim, to resolve stacks through debuginfod and to isolate the culprit layer by layer.
+metadata:
+  os: [linux]
 ---
 
 # Tracing memory growth in a native program

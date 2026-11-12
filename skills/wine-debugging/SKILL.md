@@ -1,6 +1,9 @@
 ---
 name: wine-debugging
 description: Find out why a Windows program is slow, behaves differently or dies when it runs under Wine on Linux. Use to split wall time between CPU, file access and waiting, to measure what a network share costs, to reproduce Windows text widths, and to capture a silent crash.
+metadata:
+  os: [linux]
+  scripts: [pe-stacks]
 ---
 
 # Debugging a Windows program under Wine
