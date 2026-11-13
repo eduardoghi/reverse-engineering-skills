@@ -196,7 +196,8 @@ Check this before reading any code.
   EXE. They then have their own VMT address in the EXE's range.
 - The module named in a crash log or a profiler is the file that ran. An exception address inside
   `app.exe` for a class that you found in `lib.bpl` means the EXE has its own copy.
-- On Linux or Wine, `/proc/PID/maps` lists the images that the process loaded.
+- On Linux or Wine, `/proc/PID/maps` lists the images that the process loaded. On Windows,
+  `EnumProcessModulesEx` does (see "Inspecting a running process").
 
 When both files hold the class, they share the logic, so a reading of one carries over to the other.
 The copies are separate builds, so addresses and thunk targets differ and small details can too.
@@ -426,6 +427,51 @@ for line in open(f'/proc/{pid}/maps'):
     ...
 ```
 
+On Windows the same reads go through the Win32 API from 64-bit Python with `ctypes`, and the process
+keeps running too. `LIST_MODULES_ALL` is what makes the 32-bit modules of a Delphi program visible from
+64-bit Python, and each module handle is the image's load address:
+
+```python
+import ctypes
+from ctypes import wintypes as w
+k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+k32.OpenProcess.restype = w.HANDLE
+k32.VirtualQueryEx.argtypes = [w.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+k32.ReadProcessMemory.argtypes = [w.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+                                  ctypes.POINTER(ctypes.c_size_t)]
+k32.K32EnumProcessModulesEx.argtypes = [w.HANDLE, ctypes.c_void_p, w.DWORD, ctypes.POINTER(w.DWORD), w.DWORD]
+k32.K32GetModuleFileNameExW.argtypes = [w.HANDLE, ctypes.c_void_p, w.LPWSTR, w.DWORD]
+
+class MBI(ctypes.Structure):  # MEMORY_BASIC_INFORMATION
+    _fields_ = [('BaseAddress', ctypes.c_void_p), ('AllocationBase', ctypes.c_void_p),
+                ('AllocationProtect', w.DWORD), ('PartitionId', w.WORD), ('RegionSize', ctypes.c_size_t),
+                ('State', w.DWORD), ('Protect', w.DWORD), ('Type', w.DWORD)]
+
+h = k32.OpenProcess(0x0400 | 0x0010, False, pid)  # PROCESS_QUERY_INFORMATION | PROCESS_VM_READ
+mods, needed = (ctypes.c_void_p * 1024)(), w.DWORD()
+k32.K32EnumProcessModulesEx(h, mods, ctypes.sizeof(mods), ctypes.byref(needed), 3)  # LIST_MODULES_ALL
+name = ctypes.create_unicode_buffer(260)
+for base in mods[:needed.value // ctypes.sizeof(ctypes.c_void_p)]:
+    k32.K32GetModuleFileNameExW(h, base, name, 260)
+    print(hex(base), name.value)
+
+READABLE = 0x02 | 0x04 | 0x08 | 0x20 | 0x40 | 0x80  # PAGE_READONLY to PAGE_EXECUTE_WRITECOPY
+mbi, addr = MBI(), 0
+while addr < 1 << 32 and k32.VirtualQueryEx(h, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi)):
+    lo, size = mbi.BaseAddress or 0, mbi.RegionSize
+    addr = lo + size
+    if mbi.State != 0x1000 or mbi.Protect & 0x100 or not mbi.Protect & READABLE:
+        continue      # not committed, guard page or no access
+    buf, got = ctypes.create_string_buffer(size), ctypes.c_size_t()
+    if not k32.ReadProcessMemory(h, ctypes.c_void_p(lo), buf, size, ctypes.byref(got)):
+        continue
+    data = buf.raw[:got.value]
+    ...
+```
+
+The module list also shows the WOW64 modules above 4 GB, which the scan skips. Reading a program that
+runs as administrator needs Python started as administrator too.
+
 - Reading another process needs ptrace permission. With `kernel.yama.ptrace_scope = 1` (the usual
   default) only a parent can read its child, and the read fails with `Permission denied`. Set it to
   0 with `sudo sysctl kernel.yama.ptrace_scope=0` for the session and back to 1 when done.
@@ -445,7 +491,7 @@ for line in open(f'/proc/{pid}/maps'):
   shows its normal behavior. In one test, 15 seconds of tracing `ioctl` went from over 30,000 calls to about 300.
 - The first dword of every Delphi object is its class pointer, which is the address of the exported
   VMT symbol `@Unit@TClass@` (adjusted by the rebase delta if the package didn't load at its
-  preferred base, which `/proc/PID/maps` shows). Scanning readable memory for aligned dwords equal
+  preferred base, which `/proc/PID/maps` or the module list on Windows shows). Scanning readable memory for aligned dwords equal
   to that address lists the instances. Expect false hits inside the VMT itself, in RTTI and in freed
   objects, so check a few fields before trusting one.
 - To find which field holds a sub-object when you don't know the offset, scan the object for
