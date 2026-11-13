@@ -171,6 +171,37 @@ magick shot.png -crop 900x60+0+500 part.png      # zoom into a region before rea
   ```
 
   Click the buttons by coordinates inside the dialog (`mousemove --window $d`), read from its capture.
+- To put a long text into an editor, set the clipboard and paste instead of typing. It takes no
+  time, and auto-indent and accented letters don't change what arrives. On KDE, Klipper takes and
+  returns the text over D-Bus, and the paste reaches the Wine window through XWayland:
+
+  ```sh
+  mine=$(qdbus6 org.kde.klipper /klipper getClipboardContents)        # the person's clipboard
+  qdbus6 org.kde.klipper /klipper setClipboardContents "$(sed 's/$/\r/' case.txt)"   # CRLF
+  xdotool key ctrl+Home; xdotool key ctrl+shift+End; sleep 0.3; xdotool key ctrl+v
+  ```
+
+  Select with `ctrl+Home` and `ctrl+shift+End`. `ctrl+a` can be the shortcut of a menu item, and in
+  one editor it opened a dialog that `Escape` didn't close. Reading back the same way
+  (`ctrl+c`, then `getClipboardContents`) saves the original text before the first test and shows
+  with `cmp` that it was put back after the last one. Restore the person's clipboard at the end.
+- An open menu, a drop-down list or a hint is a window of its own and isn't in the capture of the
+  main window. Capture the whole screen with the session's own tool (`spectacle -b -n -f -o
+  full.png` on KDE, since `import -window root` fails under Wayland) and crop the area. The menu
+  shows the shortcut of each item, and the shortcut is more reliable than clicking the menu again.
+- A capture taken right after a window opens can come out black, and a panel can still show the
+  result of the previous run. A pause between the action and the capture fixed both (0.6 s before
+  capturing a dialog, 1.3 s for a message panel that redraws after the dialog closes). When two
+  cases in a row show the same result, suspect the capture before the program.
+- For a batch of cases, crop from each capture only the strip that holds the result, put a label
+  above it and append the strips, so that thirty runs are read as one image:
+
+  ```sh
+  magick -background '#ddeeff' -fill black -pointsize 13 label:"$name" label.png
+  magick shot.png -crop 1150x34+0+681 +repage strip.png
+  magick label.png strip.png -append "case-$n.png"
+  magick case-*.png -append all.png
+  ```
 
 ## Text widths that differ from Windows
 
