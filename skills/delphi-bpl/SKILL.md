@@ -104,6 +104,17 @@ plugin, and Ghidra 12.1.3 or newer with the ReVa extension for long sessions.
    interface calls go through `call dword [reg + offset]` and don't show up. For those, find the VMT
    slot that points at the method (a `ptr` hit) and search for its offset.
 
+   A call on an interface pointer (`mov ebx, [eax]; call dword [ebx + 0x74]`) doesn't use the class
+   VMT. Its slot holds a stub that adjusts `Self` and jumps to the method (`add eax, -0x1c; jmp
+   Method`, or `add dword [esp+4], -0x18; jmp Method` for a stdcall method), and the tables of all
+   the interfaces of a class sit one after another. To name the method behind an offset, take a
+   method you know the interface has, find its stub (the `jmp` that `bpl-xref calls` lists for the
+   method), then the pointer to the stub (a `ptr` hit), and walk back to the start of that table.
+   The table starts with the stubs of `QueryInterface`, `AddRef` and `Release`, three in a row with
+   one adjustment, and the offset in the call counts from the first of them. Walking back over
+   everything that looks like a code pointer goes past it into the table of the previous interface
+   and shifts every slot. One table read that way came out four entries off.
+
 5. **Read the disassembly with names.** Plain `pd` shows `call 0x00401f30` and `mov edx, 0x0045c6fc`.
    Generate rizin flags for the import thunks and for the string literals the range uses, then save
    the disassembly to a file:
@@ -123,7 +134,10 @@ plugin, and Ghidra 12.1.3 or newer with the ReVa extension for long sessions.
    each instruction get slower the longer the listing: on a 60 MB package, 4 KB took 10 s, 16 KB
    didn't finish in 5 minutes, and with comments off 93 KB took 7 s, most of it startup.
    `asm.lines=false` drops the jump arrows, which only get in the way of grep. Flag names are
-   cut at 48 characters. Print the full text of a literal with `ps ascii @ addr` (AnsiString),
+   cut at 48 characters, and a literal of one or two characters gets a name that doesn't show the
+   character (`str.` for a space, `str..` for a dot, `str.__1` for an asterisk). When the reading
+   depends on which separator a `Pos` or a concatenation uses, print the bytes at the address
+   instead of trusting the name. Print the full text of a literal with `ps ascii @ addr` (AnsiString),
    `psw @ addr` (UnicodeString) or `psp @ addr` (ShortString, from its length byte). Read
    `fcomp dword [addr]` style constants with `pf f @ addr` (Single) or `pf F @ addr` (Double).
 
