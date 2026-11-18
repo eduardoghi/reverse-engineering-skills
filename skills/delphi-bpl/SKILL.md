@@ -338,7 +338,9 @@ both depends on the data.
   the object's VMT. To list what that slot runs in each class, search the file for the address of each candidate
   method as a dword. The match is the VMT slot, and its offset is the match address minus the class VMT export
   (`@Unit@TClass@`). Methods that are only reached through a slot show no `call` references, so this is also how
-  to find who runs them.
+  to find who runs them. The other way works too. To name the method behind a slot, read the dword at the class
+  VMT export plus the slot offset and look the address up in the exports. When the class comes from another
+  package, do this in that package, where its VMT and methods are exported.
 - **`TStringList.Objects`.** Up to Delphi 2007 a `TStringList` never owns the objects stored with `AddObject`, and
   freeing the list leaves them alive. Code that hangs a freshly loaded collection on a list owned by a short-lived
   object leaks one collection per object. The same fact makes it safe to keep a pointer to such an object after
@@ -374,6 +376,11 @@ both depends on the data.
   version, a size and a hash of only part of the input. In one case the processed form of some data was cached
   under a hash of its text alone, so changing an option stored elsewhere did nothing until the cache file was
   deleted.
+- **Only one row of a list is saved.** When a routine deletes the stored rows and writes back what an in-memory
+  dataset or cursor holds, check whether a range or filter is still active when the write loop runs (`SetRange`,
+  `Filtered`, or a method that calls them). The loop walks only the rows inside the range, so the rows outside it
+  are deleted and never written back, and the last filtered row is often the only one left. Look for the call that
+  sets the range in the code that runs per row, and for a `CancelRange` that comes only after the write loop.
 
 ## Comparing two builds
 
