@@ -16,6 +16,21 @@ important in the disassembly.
 Tools: `bpl-xref` (from this repo's `bin/`, needs `python-pefile`), `rizin` with the `rz-ghidra`
 plugin, and Ghidra 12.1.3 or newer with the ReVa extension for long sessions.
 
+## Reference files
+
+Read only the file that matches the problem. Each one is self-contained.
+
+- **A crash log names a module and an address.** See
+  [references/crash-logs.md](references/crash-logs.md).
+- **The code runs, but data leaks, is lost or never changes.** See
+  [references/bug-patterns.md](references/bug-patterns.md).
+- **What changed between two builds.** See
+  [references/comparing-builds.md](references/comparing-builds.md).
+- **The program has to be inspected while it runs** (objects in memory, growth, time). See
+  [references/running-process.md](references/running-process.md).
+- **A file written by `TWriter` or read by `TReader`.** See
+  [references/stream-formats.md](references/stream-formats.md).
+
 ## Method
 
 1. **Read the exports and imports.** They cost about a second even on a 30 MB package.
@@ -211,42 +226,11 @@ Check this before reading any code.
 - The module named in a crash log or a profiler is the file that ran. An exception address inside
   `app.exe` for a class that you found in `lib.bpl` means the EXE has its own copy.
 - On Linux or Wine, `/proc/PID/maps` lists the images that the process loaded. On Windows,
-  `EnumProcessModulesEx` does (see "Inspecting a running process").
+  `EnumProcessModulesEx` does (see [references/running-process.md](references/running-process.md)).
 
 When both files hold the class, they share the logic, so a reading of one carries over to the other.
 The copies are separate builds, so addresses and thunk targets differ and small details can too.
 Find the same function in the file that runs and confirm the instructions there before patching.
-
-## From a crash log line to a function
-
-A log often prints a module and an address, such as
-`Access violation at address 4A2F10C8 in module 'lib.bpl'. Read of address 00000000`. To land on the code:
-
-1. Get the module's preferred base with `rz-bin -I lib.bpl | grep baddr`. When the process loaded it at
-   that base, the logged address is the file's virtual address. A module that loaded elsewhere needs the
-   rebase delta, which `/proc/PID/maps` or a debugger gives.
-2. Sort the exports (`rz-bin -E lib.bpl`) and take the last one at or before the logged address. The
-   offset into the function is the difference. Nested procedures have no export and sit before their
-   parent, so the owner can be the next export.
-3. Disassemble a window around the address with
-   `objdump -d -M intel --start-address=... --stop-address=... lib.bpl`. In an EXE without exports,
-   walk back from the address to the nearest `push ebp; mov ebp, esp` for the start of the function and
-   run `bpl-xref calls` on it to find the callers.
-
-What the instruction tells you:
-
-- `mov reg, [ebp-4]` followed by `mov edx, [reg]`, with a read of address 0, is a method called on a
-  nil `Self`. The object was never created, or it was freed and its pointer cleared.
-- The same address repeated hundreds of times points to a deterministic nil, not to memory corruption.
-  A field freed with `FreeAndNil` and used again behaves like this, because the pointer is zero and the
-  read always faults at the same instruction. A real use after free usually shows varying addresses,
-  garbage values or crashes that come and go.
-- When the faulting function belongs to a library routine such as `TStrings.IndexOfName`, the bug is in
-  the caller that passed nil. Read the caller, not the library.
-
-Counting outcomes by message type in the same log shows how wide the failure is. Group the lines that
-report a result by type and by outcome. A type with no successes fails every time, and a type that mixes
-both depends on the data.
 
 ## Reading Delphi code
 
@@ -300,40 +284,6 @@ both depends on the data.
   the package the cell is the `vmtSelfPtr` at VMT minus 0x4C (0x58 from Delphi 2009 on), which holds
   the VMT's own address, and the class name is the ShortString just before the VMT. The class pointer is the VMT address.
   `IsClass(obj, cls)` takes the object in `eax` and the class in `edx` and answers in `al`.
-- **Library objects that the package doesn't import methods for.** The fields of VCL classes sit at fixed
-  offsets for a given compiler, so code you inject can read them directly. In the Delphi 7 era layout a
-  `TTreeNode` has the text at +8 and `Data` at +0xC, and a `TStrings` descendant answers `IndexOf`, `Add`
-  and `Delete` through virtual slots. Confirm each offset in code that already touches it (a handler that
-  reads `[node+0xC]` before using `Data`) rather than trusting a table.
-- **Creating a VCL control from injected code.** Load the class pointer from the import slot of its VMT, call
-  the constructor (`mov dl, 1`, owner in `ecx`), then `SetParent`, `SetBounds`, `SetAnchors` and `SetText`, and keep
-  the object in a state cell that the form's `OnDestroy` hook clears. Both `SetParent` and `SetBounds` are virtual,
-  so call them through the object as described in the `binary-patch` skill. With a nil owner nothing frees the
-  control when the form goes away, so pass the form as owner when the control should die with it.
-- **Editing a string literal in place.** A shorter text fits if you write the new length and leave the total
-  size alone, padding with zeros after the new terminator. A longer one doesn't fit. To drop an argument from a
-  format string without touching the code, use an index: `'%1:s'` prints the second argument of
-  `'Item %d: %s'` and ignores the first. Run `bpl-xref str` first, because every reference to the literal gets the
-  new text, including screens you didn't mean to change. When a text doesn't change on screen, it may come from a
-  translation table and not from the literal.
-- **Exceptions with extra fields.** In an `on E: Exception do` handler the exception object is kept in a
-  frame slot, saved right after the handler starts (`mov [ebp-0x30], eax`). A factory such as
-  `CreateDet(cls, message, details)` stores the extra strings in fields after the standard ones. Code that
-  logs only `E.Message` discards the rest, and `@System@@DoneExcept` frees the object, so read the field
-  before that call. Find its offset in the factory, where the extra argument is stored with `LStrAsg`.
-- **Objects created in a loop and kept only under a condition.** A loop that creates an object, hands it
-  to a routine that fills it and adds it to a parent only when it ended up non-empty (`Length > 0`)
-  leaks every empty one, because the path that skips the `Add` has no `Free`. In the disassembly look
-  for a constructor call, then a size test, then a conditional jump over the call that stores the object
-  with nothing that releases it on the other side. Confirm with memory growth per iteration (see below),
-  and after the fix compare the program's output before and after.
-- **Reference counting bugs.** Assigning a string goes through `@System@@LStrAsg` (or `UStrAsg`),
-  which adds a reference. A plain `mov [obj + x], reg` of a string pointer does not. If the source
-  is then released with `LStrClr` or `LStrArrayClr` before the field is used, the field points at
-  freed memory and the result depends on whether that memory was reused. Interface variables are
-  released with `@System@@IntfClear`. `TObject.Free` or `FreeAndNil` on one calls through the wrong
-  table and usually crashes. An object created and then overwritten without a `Free` is a leak.
-
 - **Which method a virtual call reaches.** `call dword [ecx + 0x34]` after `mov ecx, [eax]` calls slot 0x34 of
   the object's VMT. To list what that slot runs in each class, search the file for the address of each candidate
   method as a dword. The match is the VMT slot, and its offset is the match address minus the class VMT export
@@ -341,212 +291,6 @@ both depends on the data.
   to find who runs them. The other way works too. To name the method behind a slot, read the dword at the class
   VMT export plus the slot offset and look the address up in the exports. When the class comes from another
   package, do this in that package, where its VMT and methods are exported.
-- **`TStringList.Objects`.** Up to Delphi 2007 a `TStringList` never owns the objects stored with `AddObject`, and
-  freeing the list leaves them alive. Code that hangs a freshly loaded collection on a list owned by a short-lived
-  object leaks one collection per object. The same fact makes it safe to keep a pointer to such an object after
-  the list is gone. Check the `Destroy` of the owner, and of the classes in the collection, before relying on it.
-- **`TWriter` and `TReader` streams.** Component streams and many custom file formats are written value by value.
-  `ReadInteger`, `ReadBoolean`, `ReadString`, `ReadDate` and `ReadListBegin` read a one-byte type code first, and
-  `ReadStr` (a short string) does not. The codes up to Delphi 2007 are 0 `vaNull` (end of list), 1 `vaList`,
-  2 `vaInt8`, 3 `vaInt16`, 4 `vaInt32`, 5 `vaExtended` (10 bytes), 6 `vaString` (length byte), 7 `vaIdent`,
-  8 `vaFalse`, 9 `vaTrue`, 10 `vaBinary`, 11 `vaSet`, 12 `vaLString` (32-bit length), 13 `vaNil`,
-  14 `vaCollection`, 15 `vaSingle`, 16 `vaCurrency`, 17 `vaDate` (8-byte double), 18 `vaWString` (32-bit length of
-  UTF-16 units), 19 `vaInt64` and 20 `vaUTF8String`. With the reads of the loader in order, a field near the start
-  of a file can be read without loading the rest. Find the loader by searching for the field's offset in the
-  class (`add eax, OFFSET` before `@LStrAsg`, or `mov [reg + OFFSET], eax`) and follow the reads before it,
-  including the version checks (`cmp dword [eax + n], VERSION`) that skip fields in old files.
-- **When something is loaded again.** Code that loads data once (a list read from a database, a cached object)
-  usually guards it with a field of the object. It tests the field (`cmp byte [eax+0x1c], 0`), loads, and then
-  sets it (`mov byte [eax+0x1c], 1`). To learn when the data is loaded again, find every write to that offset in the methods
-  of the class. Take the address range of the class's exports and search the disassembly:
-
-  ```sh
-  objdump -d -M intel --no-show-raw-insn --start-address=0x... --stop-address=0x... app.bpl |
-      grep -E 'mov +BYTE PTR \[e[a-z]+\+0x1c\]'
-  ```
-
-  Each write of zero is a place that invalidates the data. Run `bpl-xref calls` on the methods that hold them to
-  see who triggers it. In one case only the destructor and an import routine of other subclasses cleared the flag,
-  so the data stayed in memory until the program closed. The same offset is a different field in an unrelated
-  class, so stay within the class and its descendants, which share the field layout.
-- **A stored change that has no effect.** When the program keeps ignoring a value that was changed where it is
-  stored, look for a cache of the processed result, often a file in the temporary directory or next to the data.
-  Search for format strings that build file names (`bpl-xref str app.bpl '%s.'`) and for calls to the temporary
-  directory helper, then read the check that decides whether the cache is still valid. It often compares a
-  version, a size and a hash of only part of the input. In one case the processed form of some data was cached
-  under a hash of its text alone, so changing an option stored elsewhere did nothing until the cache file was
-  deleted.
-- **Only one row of a list is saved.** When a routine deletes the stored rows and writes back what an in-memory
-  dataset or cursor holds, check whether a range or filter is still active when the write loop runs (`SetRange`,
-  `Filtered`, or a method that calls them). The loop walks only the rows inside the range, so the rows outside it
-  are deleted and never written back, and the last filtered row is often the only one left. Look for the call that
-  sets the range in the code that runs per row, and for a `CancelRange` that comes only after the write loop.
-
-## Comparing two builds
-
-Export names stay the same between builds of a package and addresses don't. Match exported
-functions by name, and nested procedures through the literals they reference (`bpl-xref str` on
-both files). Then compare only the instructions the question depends on. A function that was
-rewritten may also have been renamed or split, so when an export disappears, look for the same
-literals in the new file before concluding the code is gone.
-
-To see everything that changed between two builds, run ghidriff as described in the `binary-diff`
-skill. On a BPL it matches most functions by their export names. Filter the JSON by unit
-(`test("@Unitname@")`) to find what changed in the area you care about. The exported RTTI
-(`@$xp$...`) and VMTs (`@Unit@TClass@`) come out as functions that fail to decompile or decompile
-to nonsense, and many of them land in `modified`. Skip names that start with `@$xp$`.
-
-ghidriff misses most changes in texts and forms of a Delphi binary, such as literals with accented
-characters, messages used only in except blocks, resourcestrings and every form property. Compare
-those with `bpl-xref strings` and `bpl-xref dfm --all --no-geometry`, as the `binary-diff` skill
-shows. On an EXE, which has no exports, also name the published methods in the project with
-`bpl-xref vmt --names` and `ghidra_scripts/ApplyNames.java` before trusting the report, or changed
-event handlers can be missing from it.
-
-For a first pass over one unit, before running ghidriff, compare its exported functions instruction by
-instruction. Take each export of the unit and the next export as the range, so the nested procedures
-that sit before the next export are included. Disassemble both builds with `objdump`, mask what moves
-between builds, and compare the lists. It takes seconds for a few hundred functions.
-
-```python
-import re, subprocess
-def body(path, start, end):
-    out = subprocess.run(['objdump', '-d', '-M', 'intel', '--no-show-raw-insn',
-                          f'--start-address={start}', f'--stop-address={end}', path],
-                         capture_output=True, text=True).stdout
-    ins = [l.split('\t', 1)[1] for l in out.splitlines() if re.match(r'\s*[0-9a-f]+:\t', l)]
-    ins = [re.sub(r'0x[0-9a-f]{5,}', 'ADDR', i) for i in ins]          # absolute addresses
-    ins = [re.sub(r'([+-])0x[0-9a-f]+\]', r'\1OFF]', i) for i in ins]  # field offsets
-    return [re.sub(r'^(call|j\w+)\s+[0-9a-f]+\b.*', r'\1 X', i) for i in ins]
-```
-
-- Check that the lists are not empty before trusting an "equal". `objdump` prints 8 digit addresses
-  without leading spaces, and a pattern that required them matched nothing, so every function came
-  out "equal" between two builds that had in fact changed.
-- When a class gains fields, every method that touches the fields after the new ones changes its
-  offsets, so almost the whole unit shows up as different with the same function sizes. Masking the
-  displacements removes most of that. What is left at the same size is usually small constants that
-  also moved with the layout. Read the diff of the functions the question depends on before calling
-  the change a logic change, and use ghidriff when you need the full picture.
-
-## Inspecting a running process
-
-When the code reads the same in every build and the behaviour still differs, look at the objects in
-memory. On Linux, including programs running under Wine, `/proc/PID/mem` can be read from Python
-without attaching a debugger, and the process keeps running.
-
-```python
-mem = open(f'/proc/{pid}/mem', 'rb', 0)
-for line in open(f'/proc/{pid}/maps'):
-    lo, hi = (int(x, 16) for x in line.split()[0].split('-'))
-    if 'r' not in line.split()[1] or lo >= 0x80000000:
-        continue
-    try:
-        mem.seek(lo); data = mem.read(hi - lo)
-    except OSError:
-        continue      # guard pages and unreadable mappings
-    ...
-```
-
-On Windows the same reads go through the Win32 API from 64-bit Python with `ctypes`, and the process
-keeps running too. `LIST_MODULES_ALL` is what makes the 32-bit modules of a Delphi program visible from
-64-bit Python, and each module handle is the image's load address:
-
-```python
-import ctypes
-from ctypes import wintypes as w
-k32 = ctypes.WinDLL('kernel32', use_last_error=True)
-k32.OpenProcess.restype = w.HANDLE
-k32.VirtualQueryEx.argtypes = [w.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
-k32.ReadProcessMemory.argtypes = [w.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
-                                  ctypes.POINTER(ctypes.c_size_t)]
-k32.K32EnumProcessModulesEx.argtypes = [w.HANDLE, ctypes.c_void_p, w.DWORD, ctypes.POINTER(w.DWORD), w.DWORD]
-k32.K32GetModuleFileNameExW.argtypes = [w.HANDLE, ctypes.c_void_p, w.LPWSTR, w.DWORD]
-
-class MBI(ctypes.Structure):  # MEMORY_BASIC_INFORMATION
-    _fields_ = [('BaseAddress', ctypes.c_void_p), ('AllocationBase', ctypes.c_void_p),
-                ('AllocationProtect', w.DWORD), ('PartitionId', w.WORD), ('RegionSize', ctypes.c_size_t),
-                ('State', w.DWORD), ('Protect', w.DWORD), ('Type', w.DWORD)]
-
-h = k32.OpenProcess(0x0400 | 0x0010, False, pid)  # PROCESS_QUERY_INFORMATION | PROCESS_VM_READ
-mods, needed = (ctypes.c_void_p * 1024)(), w.DWORD()
-k32.K32EnumProcessModulesEx(h, mods, ctypes.sizeof(mods), ctypes.byref(needed), 3)  # LIST_MODULES_ALL
-name = ctypes.create_unicode_buffer(260)
-for base in mods[:needed.value // ctypes.sizeof(ctypes.c_void_p)]:
-    k32.K32GetModuleFileNameExW(h, base, name, 260)
-    print(hex(base), name.value)
-
-READABLE = 0x02 | 0x04 | 0x08 | 0x20 | 0x40 | 0x80  # PAGE_READONLY to PAGE_EXECUTE_WRITECOPY
-mbi, addr = MBI(), 0
-while addr < 1 << 32 and k32.VirtualQueryEx(h, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi)):
-    lo, size = mbi.BaseAddress or 0, mbi.RegionSize
-    addr = lo + size
-    if mbi.State != 0x1000 or mbi.Protect & 0x100 or not mbi.Protect & READABLE:
-        continue      # not committed, guard page or no access
-    buf, got = ctypes.create_string_buffer(size), ctypes.c_size_t()
-    if not k32.ReadProcessMemory(h, ctypes.c_void_p(lo), buf, size, ctypes.byref(got)):
-        continue
-    data = buf.raw[:got.value]
-    ...
-```
-
-The module list also shows the WOW64 modules above 4 GB, which the scan skips. Reading a program that
-runs as administrator needs Python started as administrator too.
-
-- Reading another process needs ptrace permission. With `kernel.yama.ptrace_scope = 1` (the usual
-  default) only a parent can read its child, and the read fails with `Permission denied`. Set it to
-  0 with `sudo sysctl kernel.yama.ptrace_scope=0` for the session and back to 1 when done.
-  Without sudo, a program you start yourself can allow it for its own process, which is useful with
-  `strace -p` once it has settled, since starting it under `strace` slows down its startup. The
-  exception ends with the process, but while it runs any program of the same user can trace it.
-
-  ```sh
-  python3 -I -c 'import ctypes, os, sys
-  ctypes.CDLL(None).prctl(0x59616d61, ctypes.c_ulong(-1).value, 0, 0, 0)  # PR_SET_PTRACER, any
-  os.execv(sys.argv[1], sys.argv[1:])' ./program &
-  sleep 15
-  strace -f -e trace=ioctl -p $!
-  ```
-
-  `strace -k` adds a stack to each call and can slow a busy program so much that the trace no longer
-  shows its normal behavior. In one test, 15 seconds of tracing `ioctl` went from over 30,000 calls to about 300.
-- The first dword of every Delphi object is its class pointer, which is the address of the exported
-  VMT symbol `@Unit@TClass@` (adjusted by the rebase delta if the package didn't load at its
-  preferred base, which `/proc/PID/maps` or the module list on Windows shows). Scanning readable memory for aligned dwords equal
-  to that address lists the instances. Expect false hits inside the VMT itself, in RTTI and in freed
-  objects, so check a few fields before trusting one.
-- To find which field holds a sub-object when you don't know the offset, scan the object for
-  pointers whose target starts with the VMT of the class you expect. Then read the container. Get the
-  layout from the getters (`TList.GetCount`, `TCollection.GetCount`) in the build you are looking
-  at, since field offsets change between compiler versions.
-- An AnsiString field points at the first character, with the length in the dword before it and the
-  reference count before that.
-- Comparing instances answers questions that the code alone doesn't. For example, when the same data
-  exists in a runtime object and in an edit copy, counting the items each one holds shows which copy
-  lost them.
-
-- **Growth per unit of work.** To compare variants of a patched binary, sample the resident size and a
-  counter that a hook increments once per unit, then divide the growth by the units over the same
-  range for every variant. The cost of a unit depends on its content, so the cumulative average of runs
-  of different lengths misleads. One variant looked like 0.77 MB per item that way and was 1.14 over the
-  range the other runs shared. Disabling one callee at a time narrows a leak down quickly, but a variant
-  that skips only the allocation's consumer may not change anything, because the leaked object is created
-  before it.
-- **Where the time goes.** Sampling `/proc/PID/task/TID/stat` (the state letter) and
-  `/proc/PID/task/TID/syscall` shows whether the main thread is running or blocked, and in which system
-  call. `perf record -e cpu-clock:u -g -p PID` counts CPU only, so a program that spends most of its time
-  waiting looks almost idle, and the wall clock is the number that matters to the user. Under Wine the
-  packages have no names in `/proc/PID/maps`. Build the module table by reading the first bytes of each
-  candidate image at its preferred base from `/proc/PID/mem` and comparing the `TimeDateStamp` with the
-  file's header, then name each sampled address with the nearest export from `rz-bin -E`. The
-  `wine-debugging` skill has the rest.
-
-Debuggers under Wine are fragile. `winedbg --gdb` on a 32-bit program in Wine's new WoW64 mode
-reports the target as i386, but its break-in thread runs at a 64-bit address. gdb truncates that
-address, reports a SIGSEGV, and detaching then can leave the program dead or frozen. The gdb proxy
-also accepts a single connection, so a failed session can't be resumed. Prefer reading memory as
-above, or a GUI debugger such as x32dbg running inside the same Wine prefix, and warn whoever is
-using the program that it may close.
 
 ## Ghidra and ReVa
 
