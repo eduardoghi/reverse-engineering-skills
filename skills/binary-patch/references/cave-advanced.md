@@ -19,6 +19,24 @@ that may raise an exception.
     Locals for `@LStrArrayClr` must be contiguous and in increasing address order.
   - Paths the program passes are in the ANSI code page. Convert them with `MultiByteToWideChar(CP_ACP)` in the
     DLL instead of assuming UTF-8.
+- **Calling the host from the DLL.** A Delphi package exports every routine by its mangled name, so the DLL
+  can find them with `GetModuleHandleA` on the package and `GetProcAddress` with the exact export name, and
+  fall back to the original behaviour when one is missing. Call them with a few lines of inline assembly
+  that load `eax`, `edx` and `ecx` and mark the C caller-saved registers as clobbered. The register
+  convention keeps `ebx`, `esi`, `edi` and `ebp`, like the C one.
+  - A constructor takes the class (the VMT export, `@Unit@TClass@`) in `eax`, 1 in `dl` to allocate, and its
+    first parameter in `ecx`.
+  - A result record larger than 4 bytes, such as `TMethod`, comes back through a hidden pointer passed after
+    the declared parameters.
+  - For a fixed `const AnsiString` argument, a static literal laid out like the compiler's own also works:
+    reference count -1, length, the characters and a zero, passing the address of the first character.
+    Delphi treats a count of -1 as a constant and copies the text when the callee keeps it. Text built at
+    run time still goes through `@LStrFromPChar`.
+- **Handling an event of the host.** A `TNotifyEvent` handler is a `TMethod`, code and data. The code gets
+  the data in `eax` and the sender in `edx`, so point it at a naked stub that pushes both and calls a C
+  function. Set it with `TypInfo.SetMethodProp(Instance, 'OnClick', Method)`, which finds the field by the
+  published property name, so no field offset is needed. To switch an event off while the patch works, read
+  it with `GetMethodProp`, set an empty `TMethod` and put the old one back at the end.
 - **Exception handling in a cave.** When the cave calls host code that may raise, such as an export routine
   that fails for an object that doesn't exist yet, protect the call the way Delphi compiles `try ... except`.
   The handler address goes through `call`/`pop`, so it needs no relocation:

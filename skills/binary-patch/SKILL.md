@@ -118,6 +118,13 @@ preferred range is taken, so treat every absolute address as something the loade
   `eax`, `edx` and `ecx` still hold the arguments, so save what the cave clobbers and restore it before
   the jump back. Replace whole instructions only, and check that no branch targets the middle of the
   replaced range.
+- **Running code after a Delphi routine.** A routine with a `try/finally` ends with `push <epilogue>`
+  followed by the finally body and `ret`, so the finally returns to the epilogue. Replace the immediate of
+  that `push` with the address of the cave. The cave still runs in the routine's frame, with Self usually
+  at `[ebp-4]` and the parameters where the prologue stored them, and ends with a `jmp` to the original
+  epilogue. No instruction moves. The original operand is an absolute address with its own `.reloc`
+  entry, so the new value, also inside the image, gets the same correction when the package loads
+  elsewhere.
 - **Constants that the loader relocates.** A class pointer, a table address or an import slot that the
   code loads with `mov eax, [abs]` is relocated by the loader, so the cave can't hold its own copy of
   the address. Read the operand of the existing instruction instead. The operand sits inside the
