@@ -291,6 +291,13 @@ Find the same function in the file that runs and confirm the instructions there 
   to find who runs them. The other way works too. To name the method behind a slot, read the dword at the class
   VMT export plus the slot offset and look the address up in the exports. When the class comes from another
   package, do this in that package, where its VMT and methods are exported.
+- **`TTreeNode.MoveTo` expands the new parent.** After the move it calls `SetChildren(True)` and
+  `SetExpanded(True)` on the destination, which fires the tree's `OnExpanding`. In a program that asks for a
+  password or loads data on expansion, that runs for every node moved. Switch the event off during the moves
+  and collapse again the nodes that were closed before.
+- **Code that finds nodes by position.** Before removing or moving nodes of a `TTreeView`, read how the
+  program finds them. Getters like `GetFirstNode` followed by `getNextSibling`, and event handlers that
+  compare the selected node with them, break or dereference nil when a group node disappears.
 
 ## Ghidra and ReVa
 
