@@ -185,6 +185,13 @@ magick shot.png -crop 900x60+0+500 part.png      # zoom into a region before rea
   one editor it opened a dialog that `Escape` didn't close. Reading back the same way
   (`ctrl+c`, then `getClipboardContents`) saves the original text before the first test and shows
   with `cmp` that it was put back after the last one. Restore the person's clipboard at the end.
+- A menu that opens is a window without a name owned by the same process. `xdotool search --onlyvisible
+  --pid <pid>` lists it, and `import -window <id>` captures just the menu, without capturing the whole
+  screen.
+- With more than one monitor, Wine can open the windows on a monitor the person isn't looking at. Compare
+  `xdotool getwindowgeometry` with `xrandr --listmonitors`. `windowmove` moves a normal window, but a
+  maximized one ignores it until `xdotool windowstate --remove MAXIMIZED_VERT --remove MAXIMIZED_HORZ`,
+  and `--add` maximizes it again on the new monitor.
 - An open menu, a drop-down list or a hint is a window of its own and isn't in the capture of the
   main window. Capture the whole screen with the session's own tool (`spectacle -b -n -f -o
   full.png` on KDE, since `import -window root` fails under Wayland) and crop the area. The menu
