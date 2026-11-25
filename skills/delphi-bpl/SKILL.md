@@ -240,12 +240,18 @@ Find the same function in the file that runs and confirm the instructions there 
   The return type is not encoded.
 - **Parameter codes.** `x` const, `r` var (by reference), `p` pointer, `v` no parameters, `i` Integer,
   `o` Boolean, `us` Word, `uc` Byte, `d` Double, `g` Extended, and a length-prefixed type name such as
-  `17System@AnsiString`. `$qqrx17System@AnsiStringd` is `(const s: AnsiString; d: Double)`.
+  `17System@AnsiString`. `$qqrx17System@AnsiStringd` is `(const s: AnsiString; d: Double)`. An open
+  array parameter travels as two arguments, the pointer and the highest index.
+  `px17System@AnsiStringxi` is `const a: array of AnsiString`, and `-1` as the index means an empty
+  array.
 - **Register convention.** Self goes in `eax` for methods. The first three integer, pointer or string
   parameters go in `eax`, `edx`, `ecx`, and the rest are pushed left to right. `Double` and
   `Extended` always go on the stack, so the decompiler numbers them in reverse (`param_7` is the
   first one). Ordinal results come back in `eax`, floats in `ST(0)`, and strings and records through
-  a hidden last `var` parameter.
+  a hidden last `var` parameter. The callee removes its own stack parameters, so a call that builds
+  an argument can sit between the pushes of the outer call, with pushes of its own that it removes.
+  When you read pushed arguments, count them per call and account for `pop` into registers, or
+  recognize the argument by its content.
 - **Strings.** An AnsiString literal has a `-1` reference count and a 32-bit length right before the
   first character, and code points at that character. A UnicodeString literal (Delphi 2009 and later)
   is UTF-16 with the same layout plus a code page and element size. ShortString constants and RTTI
@@ -253,6 +259,12 @@ Find the same function in the file that runs and confirm the instructions there 
   or later, `@System@@LStrCat` alone means an older compiler.
 - **Calls to other packages** go through a `jmp dword [import]` thunk. rizin names it
   `sub.<package>.bpl__<Unit>_<Func>`, so the thunk name is the callee.
+- **`case` statements** compile to `jmp dword [eax*4 + table]` with the table of addresses inline
+  after the jump. Linear disassembly reads the table as instructions and loses sync, so read the
+  dwords at the table address and disassemble from each target.
+- **Nested procedures** get the parent's frame pointer as a hidden parameter and read the parent's
+  locals through it, so a negative offset from a pointer loaded from `[ebp+8]` is a local of the
+  enclosing function.
 - **Object fields** are offsets from Self (`[eax + 0x480]`). Ghidra may type Self as a pointer and
   scale the offset, so `(ushort *)p + 0x240` is byte offset `0x480`. Getter and setter exports
   (`GetFoo`/`SetFoo`) are a cheap way to map offsets to field names: decompile a few and read the
@@ -338,7 +350,10 @@ Find the same function in the file that runs and confirm the instructions there 
   `pefile.PE(path, max_symbol_exports=1 << 20)`. Changing `pefile.MAX_SYMBOL_EXPORT_COUNT` has no
   effect, because the constructor reads it only as a default. Its import list is also incomplete for
   large BPLs. It stops after 8192 symbols and silently drops names with characters such as `%`,
-  which Delphi uses in `System@%SmallString$iuc$255%`. `bpl-xref` reads the import table itself.
+  which Delphi uses in `System@%SmallString$iuc$255%`. The 8192-symbol cut drops whole DLL
+  descriptors, not just names. A script that walks `pe.DIRECTORY_ENTRY_IMPORT` and reads each thunk
+  table by hand still misses every DLL after the cut. Walk the descriptors from the import data
+  directory instead, as `bpl-xref` does.
 - **IDR** (Interactive Delphi Reconstructor) recovers class and form data from EXEs, but it's
   GUI-only on Windows and supports up to Delphi XE4. For BPLs the exports already give the names it
   would recover. Dhrake needs IDR's output.
