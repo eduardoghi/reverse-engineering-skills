@@ -20,6 +20,7 @@ import argparse
 import bisect
 import codecs
 import collections
+import json
 import math
 import re
 import struct
@@ -994,6 +995,35 @@ def dfm_text(obj, indent=0):
     return lines
 
 
+def dfm_json_value(kind, value):
+    """A value as plain JSON. Identifiers and strings are both strings, sets and lists are arrays,
+    collection items are objects with their index and properties, and binary data is its size. An
+    infinite or NaN float becomes a string, since standard JSON has no number for it."""
+    if kind == "float" and not math.isfinite(value):
+        return str(value)
+    if kind == "list":
+        return [dfm_json_value(k, v) for k, v in value]
+    if kind == "set":
+        return list(value)
+    if kind == "binary":
+        return {"binary": len(value)}
+    if kind == "collection":
+        return [{"index": index, "props": dfm_json_props(props)} for index, props in value]
+    return value
+
+
+def dfm_json_props(props):
+    return {name: dfm_json_value(kind, value) for name, (kind, value) in props}
+
+
+def dfm_json(obj):
+    """An object tree as nested dictionaries for --json."""
+    keyword = ("inline" if obj["flags"] & DfmReader.FLAG_INLINE
+               else "inherited" if obj["flags"] & DfmReader.FLAG_INHERITED else "object")
+    return {"name": obj["name"], "class": obj["class"], "kind": keyword,
+            "props": dfm_json_props(obj["props"]), "children": [dfm_json(c) for c in obj["children"]]}
+
+
 def dfm_without(obj, names):
     """Copy of an object tree without the named properties, in collection items too."""
     def props(items):
@@ -1061,7 +1091,7 @@ def cmd_dfm(img, args):
                     if f[0].lower() in wanted or (f[2] and {f[2]["class"].lower(), f[2]["name"].lower()} & wanted)]
         if not selected:
             sys.exit("bpl-xref: no form with that resource, class or object name (run without FORM to list them)")
-    elif args.events or args.all:
+    elif args.events or args.all or args.json:
         selected = forms
     else:
         for res, size, obj, err in forms:
@@ -1070,6 +1100,19 @@ def cmd_dfm(img, args):
                 print(f"{safe(res)}  {safe(obj['name'])}: {safe(obj['class'])}  {size} bytes  {n} events")
             else:
                 print(f"{safe(res)}  {size} bytes  unreadable: {err}")
+        return
+
+    if args.json:
+        out = []
+        for res, size, obj, err in selected:
+            if not obj:
+                out.append({"resource": res, "error": err})
+                continue
+            tree = dfm_without(obj, DFM_GEOMETRY) if args.no_geometry else obj
+            out.append({"resource": res, **dfm_json(tree)})
+        # ASCII escapes keep control characters from a hostile file away from the terminal.
+        json.dump(out, sys.stdout, indent=1, allow_nan=False)
+        print()
         return
 
     by_class, by_method = method_index(img) if args.events else ({}, {})
@@ -1232,14 +1275,18 @@ def main():
                                    "With --events, print each event handler and the exported method "
                                    "it names, for the given forms or for all of them. Without an "
                                    "export, as in an EXE, the handler is looked up in the published "
-                                   "method tables of the form class and its ancestors. Binary "
-                                   "properties such as images are shown only by size.")
+                                   "method tables of the form class and its ancestors. With --json, "
+                                   "print the given forms, or all of them, as a JSON array of "
+                                   "component trees for scripts. Binary properties such as images "
+                                   "are shown only by size.")
     p.add_argument("file")
     p.add_argument("forms", nargs="*", metavar="form", help="resource, class or object name (any case)")
     p.add_argument("--events", action="store_true", help="print event handlers and their methods")
     p.add_argument("--all", action="store_true", help="print every form as text")
     p.add_argument("--no-geometry", action="store_true",
                    help="leave out position and size properties (Left, Top, Width, Height and similar)")
+    p.add_argument("--json", action="store_true",
+                   help="print the forms as JSON: name, class, kind, props and children of each object")
     p.set_defaults(func=cmd_dfm)
 
     p = sub.add_parser("vmt", help="list classes or print their published methods and fields",

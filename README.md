@@ -35,9 +35,9 @@ Skills and helper scripts for Claude Code reverse-engineering work. New skills g
   that uses a string literal or a resourcestring (`str`), the calls and pointers to an address
   (`calls`), prints rizin flags that name import thunks and string literals in the disassembly
   (`flags`), lists every literal and resourcestring in a form `diff` can compare between builds
-  (`strings`), reads the form resources to map each event to its method (`dfm`) and lists the
-  published methods and fields of each class from its VMT, which also works on EXEs without exports
-  (`vmt`).
+  (`strings`), reads the form resources to map each event to its method or prints them as JSON for
+  scripts (`dfm`) and lists the published methods and fields of each class from its VMT, which also
+  works on EXEs without exports (`vmt`).
 - `bin/pe-stacks`: call stacks of 32-bit Windows code from a `perf` recording of a Wine process, used by
   the `wine-debugging` skill. Under wow64 `perf` can't unwind those frames, so it scans the raw user
   stack that `--call-graph=dwarf` copies for return addresses into the PE images and names them from

@@ -5,6 +5,7 @@ and record references, an import thunk, AnsiString literals, VMTs with published
 methods and fields, form and string table resources, exports and a relocation
 table. Run with `python3 -m unittest discover -s tests`. Needs pefile.
 """
+import json
 import os
 import struct
 import subprocess
@@ -538,6 +539,19 @@ class DfmTest(Fixtures):
         self.assertIn(f"  Caption = '{CAPTION}'", out)
         self.assertIn("      Title = 'Customer'", out)
         self.assertIn("    OnClick = BtnSaveClick", out)
+
+    def test_json(self):
+        forms = json.loads(self.ok("dfm", "--json", "--no-geometry", self.bpl))
+        self.assertEqual([f["resource"] for f in forms], ["TFGHOST", "TFORDEREDIT"])
+        edit = forms[1]
+        self.assertEqual((edit["name"], edit["class"], edit["kind"]), ("FOrderEdit", "TFOrderEdit", "object"))
+        self.assertEqual(edit["props"]["Caption"], CAPTION)
+        self.assertNotIn("Left", edit["props"])
+        self.assertEqual(edit["props"]["Columns"], [{"index": None, "props": {"Title": "Customer"}}])
+        self.assertEqual([(c["name"], c["props"]) for c in edit["children"]],
+                         [("BtnSave", {"OnClick": "BtnSaveClick"}), ("BtnCancel", {"OnClick": "BtnCancelClick"})])
+        one = json.loads(self.ok("dfm", "--json", self.bpl, "fghost"))
+        self.assertEqual([f["name"] for f in one], ["FGhost"])
 
     def test_events_in_a_package(self):
         out = self.ok("dfm", "--events", self.bpl)

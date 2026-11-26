@@ -82,6 +82,7 @@ Read only the file that matches the problem. Each one is self-contained.
    bpl-xref dfm app.bpl                          # every form, its class and number of events
    bpl-xref dfm app.bpl TFORDEREDIT              # one form as text .dfm
    bpl-xref dfm --events app.bpl | grep -i -A1 'btnSave'
+   bpl-xref dfm --json --no-geometry app.bpl     # every form as a component tree for a script
    ```
 
    Find the form by a caption or label in the text output, then take the component's `OnClick`,
