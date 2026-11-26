@@ -232,6 +232,14 @@ When both files hold the class, they share the logic, so a reading of one carrie
 The copies are separate builds, so addresses and thunk targets differ and small details can too.
 Find the same function in the file that runs and confirm the instructions there before patching.
 
+**Naming functions in an EXE that embeds the units.** Such an EXE exports nothing, but its functions
+have the same bytes as the package exports apart from addresses. Mask the 4 bytes of every relocation
+and the operand of every `call`/`jmp rel32` on both sides, take the call targets and relocated code
+pointers of the EXE as function starts, and compare the first bytes of each package export against
+them. Overloads often share their first bytes. A unit keeps its layout, so place an ambiguous function
+at the same distance from a uniquely matched neighbour and check the bytes there. Code that matches no
+package belongs to units only the EXE has, and that is where its own behaviour lives.
+
 ## Reading Delphi code
 
 - **Mangled names.** `@Unit@TClass@Method$qqr<params>`. `$qqr` is the register convention, `$qqs`
@@ -243,7 +251,10 @@ Find the same function in the file that runs and confirm the instructions there 
   `17System@AnsiString`. `$qqrx17System@AnsiStringd` is `(const s: AnsiString; d: Double)`. An open
   array parameter travels as two arguments, the pointer and the highest index.
   `px17System@AnsiStringxi` is `const a: array of AnsiString`, and `-1` as the index means an empty
-  array.
+  array. An open array built for a call shows up as `lea eax, [ebp - X]; push eax; push N`, and its
+  elements are locals written just before. In a function without an `ebp` frame the locals are
+  addressed through `esp`, which moves with every push, so add the bytes pushed between the write and
+  the `lea` before matching them.
 - **Register convention.** Self goes in `eax` for methods. The first three integer, pointer or string
   parameters go in `eax`, `edx`, `ecx`, and the rest are pushed left to right. `Double` and
   `Extended` always go on the stack, so the decompiler numbers them in reverse (`param_7` is the
@@ -261,7 +272,17 @@ Find the same function in the file that runs and confirm the instructions there 
   `sub.<package>.bpl__<Unit>_<Func>`, so the thunk name is the callee.
 - **`case` statements** compile to `jmp dword [eax*4 + table]` with the table of addresses inline
   after the jump. Linear disassembly reads the table as instructions and loses sync, so read the
-  dwords at the table address and disassemble from each target.
+  dwords at the table address and disassemble from each target. The jump is preceded by
+  `cmp eax, N; ja <default>`, so values above the table go to the default branch. They are not unknown
+  cases.
+- **A value chosen in a `case` and passed on.** Code often assigns a literal to a local in each branch
+  (`LStrLAsg` into `[ebp - X]`) and passes the local afterwards. Collect every literal assigned to that
+  local in the function. When two locals are filled per branch, pair each value with the one assigned
+  just before it in the same branch.
+- **Global variables.** An imported variable is read as `mov eax, [slot]; mov eax, [eax]`, and the
+  import name of the slot says which one it is. An argument read from `Sysutils.EmptyStr` is an empty
+  string, not a value you need to trace. An initialized typed constant is read as `mov edx, [address]`
+  with a data address that holds a pointer to the literal, so it can be read statically.
 - **Nested procedures** get the parent's frame pointer as a hidden parameter and read the parent's
   locals through it, so a negative offset from a pointer loaded from `[ebp+8]` is a local of the
   enclosing function.
