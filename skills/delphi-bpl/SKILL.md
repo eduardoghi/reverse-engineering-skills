@@ -241,6 +241,24 @@ them. Overloads often share their first bytes. A unit keeps its layout, so place
 at the same distance from a uniquely matched neighbour and check the bytes there. Code that matches no
 package belongs to units only the EXE has, and that is where its own behaviour lives.
 
+Not every call target or relocated code pointer starts a function. Leave out the handler address of a
+try block (`push ebp; push <handler>; push dword fs:[eax]`), the return address that a finally pushes
+after restoring `fs:[0]` (`mov fs:[eax], edx; push <address>`), the entries of a case table, and an E8
+target found by the byte scan inside data or inside another instruction. To spot the last kind,
+disassemble from the previous start that has a frame prologue (`push ebp; mov ebp, esp`) and drop the
+target when an instruction straddles it before any `ret` or `jmp`. Starting from a relocated pointer
+is not safe, because it may point to a string or a VMT. A false start splits a function, and the second
+half then seems to use locals and registers that nothing set. An EXE built with runtime packages still
+imports the RTL through `jmp dword [import]` thunks. The thunk is a call target too, so name it after
+the import, not as an unnamed start.
+
+**Finding the class of a method in such an EXE.** Its own units have no names, but the code that
+creates an object shows the class (`mov dl, 1; mov eax, [VMT]; call <constructor>`, with the result
+stored in a local or a register). Every function called with that object in `eax` is a method of the
+class, and so is every function those methods call with Self in `eax`. A nested procedure takes the
+class of the function that calls it. With the methods grouped, a field that the constructor fills
+with a literal can be read statically wherever a method reads it.
+
 ## Reading Delphi code
 
 - **Mangled names.** `@Unit@TClass@Method$qqr<params>`. `$qqr` is the register convention, `$qqs`
@@ -263,11 +281,18 @@ package belongs to units only the EXE has, and that is where its own behaviour l
   a hidden last `var` parameter. The callee removes its own stack parameters, so a call that builds
   an argument can sit between the pushes of the outer call, with pushes of its own that it removes.
   When you read pushed arguments, count them per call and account for `pop` into registers, or
-  recognize the argument by its content.
+  recognize the argument by its content. A prologue that zeroes many locals uses `ecx` as the loop
+  counter (`push ecx; mov ecx, N; push 0; push 0; dec ecx; jne; xchg [ebp - 4], ecx`). The `xchg`
+  puts the caller's `ecx` back, so when you trace a parameter back to the entry, stop there instead
+  of reading `mov ecx, N` as its value.
 - **Strings.** An AnsiString literal has a `-1` reference count and a 32-bit length right before the
   first character, and code points at that character. A UnicodeString literal (Delphi 2009 and later)
   is UTF-16 with the same layout plus a code page and element size. ShortString constants and RTTI
-  names are referenced through their length byte. Exports such as `@System@@UStrCat` mean Delphi 2009
+  names are referenced through their length byte. A ShortString argument is often built in a local
+  before the call. A 4-byte immediate holds the length byte and up to three characters
+  (`mov dword [ebp - X], 0x43424103` is `"\x03ABC"`), and a longer one is copied from a literal with
+  `lea edi, [ebp - X]; mov esi, <literal>; movsd`. `LStrFromString` then turns it into an AnsiString.
+  Exports such as `@System@@UStrCat` mean Delphi 2009
   or later, `@System@@LStrCat` alone means an older compiler.
 - **Calls to other packages** go through a `jmp dword [import]` thunk. rizin names it
   `sub.<package>.bpl__<Unit>_<Func>`, so the thunk name is the callee.
@@ -286,7 +311,9 @@ package belongs to units only the EXE has, and that is where its own behaviour l
   with a data address that holds a pointer to the literal, so it can be read statically.
 - **Nested procedures** get the parent's frame pointer as a hidden parameter and read the parent's
   locals through it, so a negative offset from a pointer loaded from `[ebp+8]` is a local of the
-  enclosing function.
+  enclosing function. For the same reason a nested procedure can write any local of the parent. When
+  you follow a value through a local, a call to a nested procedure in between (`push ebp;
+  call <nested>`) may have changed it.
 - **Object fields** are offsets from Self (`[eax + 0x480]`). Ghidra may type Self as a pointer and
   scale the offset, so `(ushort *)p + 0x240` is byte offset `0x480`. Getter and setter exports
   (`GetFoo`/`SetFoo`) are a cheap way to map offsets to field names: decompile a few and read the
